@@ -19,8 +19,10 @@ func setupStore(t *testing.T, prefix string) (*Store, func()) {
 		t.Fatalf("failed to initialize store: %v", err)
 	}
 
-	// We no longer need to manually delete the file because t.TempDir() handles it!
+	// We no longer need to manually delete the file because t.TempDir() handles it
+	// However, we MUST close the store to release file descriptors on Windows
 	cleanup := func() {
+		_ = s.Close()
 	}
 
 	return s, cleanup
