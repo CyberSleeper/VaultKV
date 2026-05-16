@@ -271,49 +271,8 @@ func (s *Store) getInternal(targetKey string) (string, bool) {
 }
 
 func (s *Store) Delete(key string) error {
-	if s.wal == nil {
-		return errors.New("WAL is not initialized")
-	}
-
-	s.mu.Lock()
-
-	err := s.wal.Append(&LogEntry{
-		Key:   key,
-		Value: tombstone,
-	})
-	if err != nil {
-		s.mu.Unlock()
-		return err
-	}
-
-	s.data.Delete(key)
-
-	var task *flushTask
-	if s.data.IsFull() {
-		task, err = s.flushMemTable()
-		if err != nil {
-			s.mu.Unlock()
-			return err
-		}
-	}
-	s.mu.Unlock()
-
-	if task != nil {
-		func() {
-			defer func() {
-				if r := recover(); r != nil {
-					if fmt.Sprint(r) == "send on closed channel" {
-						_ = task.wal.Close()
-						return
-					}
-					panic(r)
-				}
-			}()
-			s.flushChan <- task
-		}()
-	}
-
-	return nil
+	// A Delete is just a Set with the TOMBSTONE value
+	return s.Set(key, tombstone)
 }
 
 func (s *Store) flushMemTable() (*flushTask, error) {
