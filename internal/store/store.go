@@ -14,7 +14,7 @@ import (
 	"time"
 )
 
-const memTableSizeThreshold = 4 * 1024 // 4MB
+const memTableSizeThreshold = 4 * 1024 * 1024 // 4MB
 
 var validNodeID = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
 
@@ -384,11 +384,18 @@ func (s *Store) Close() error {
 
 	s.flushWg.Wait()
 
-	s.wal.Close()
+	var errs []error
+	if err := s.wal.Close(); err != nil {
+		errs = append(errs, fmt.Errorf("failed to close WAL: %w", err))
+	}
 	for _, sst := range s.sstables {
 		if err := sst.Close(); err != nil {
-			return fmt.Errorf("failed to close SSTable: %w", err)
+			errs = append(errs, fmt.Errorf("failed to close SSTable: %w", err))
 		}
+	}
+
+	if len(errs) > 0 {
+		return errors.Join(errs...)
 	}
 
 	return nil
