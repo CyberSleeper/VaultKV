@@ -3,6 +3,8 @@ package store
 import (
 	"bytes"
 	"encoding/binary"
+	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -106,6 +108,167 @@ func TestSSTable_Decode_Option3(t *testing.T) {
 		}
 	}
 	t.Log("✅ Decode completely successful! All entries matched perfectly.")
+}
+
+func TestSSTable_OnDiskRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "roundtrip.sst")
+
+	// 1. Build a skiplist with a few known entries (in alphabetical order
+	//    because SSTable point reads rely on sorted index).
+	sl := NewSkiplist()
+	sl.Set("apple", "red")
+	sl.Set("banana", "yellow")
+	sl.Set("cherry", "crimson")
+
+	// 2. Create + flush the SSTable
+	sst, err := NewSSTable(path)
+	if err != nil {
+		t.Fatalf("NewSSTable failed: %v", err)
+	}
+	if err := sst.Flush(sl); err != nil {
+		t.Fatalf("Flush failed: %v", err)
+	}
+	if err := sst.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	// 3. Reopen and load the index block
+	reopened, err := NewSSTable(path)
+	if err != nil {
+		t.Fatalf("reopen NewSSTable failed: %v", err)
+	}
+	defer reopened.Close()
+
+	if err := reopened.LoadIndexBlock(); err != nil {
+		t.Fatalf("LoadIndexBlock failed: %v", err)
+	}
+
+	// 4. Verify index has the right number of entries in sorted order
+	if len(reopened.indexEntries) != 3 {
+		t.Fatalf("expected 3 index entries, got %d", len(reopened.indexEntries))
+	}
+
+	expectedKeys := []string{"apple", "banana", "cherry"}
+	for i, want := range expectedKeys {
+		if string(reopened.indexEntries[i].keyBytes) != want {
+			t.Errorf("index[%d]: expected key %q, got %q", i, want, string(reopened.indexEntries[i].keyBytes))
+		}
+	}
+
+	// 5. Sanity-check: a point read via the pointer we just loaded should land
+	//    on the right record. We replicate the layout the Store uses:
+	//    [keyLen(2)][valLen(4)][key][value]
+	ptr := reopened.indexEntries[1].ptr // "banana"
+	keyLenBuf := make([]byte, 2)
+	valLenBuf := make([]byte, 4)
+	if _, err := reopened.fd.ReadAt(keyLenBuf, int64(ptr)); err != nil {
+		t.Fatalf("ReadAt keyLen failed: %v", err)
+	}
+	if _, err := reopened.fd.ReadAt(valLenBuf, int64(ptr)+2); err != nil {
+		t.Fatalf("ReadAt valLen failed: %v", err)
+	}
+	keyLen := binary.LittleEndian.Uint16(keyLenBuf)
+	valLen := binary.LittleEndian.Uint32(valLenBuf)
+
+	valBytes := make([]byte, valLen)
+	valOffset := int64(ptr) + 2 + 4 + int64(keyLen)
+	if _, err := reopened.fd.ReadAt(valBytes, valOffset); err != nil {
+		t.Fatalf("ReadAt val failed: %v", err)
+	}
+	if string(valBytes) != "yellow" {
+		t.Errorf("expected value 'yellow' at index[1], got %q", string(valBytes))
+	}
+}
+
+func TestSSTable_LoadIndexBlock_BadMagic(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "bad_magic.sst")
+
+	sl := NewSkiplist()
+	sl.Set("k", "v")
+
+	sst, err := NewSSTable(path)
+	if err != nil {
+		t.Fatalf("NewSSTable failed: %v", err)
+	}
+	if err := sst.Flush(sl); err != nil {
+		t.Fatalf("Flush failed: %v", err)
+	}
+	sst.Close()
+
+	// Corrupt the magic number (bytes [size-8, size-4))
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile failed: %v", err)
+	}
+	if len(raw) < 8 {
+		t.Fatalf("SST file too small: %d", len(raw))
+	}
+	for i := len(raw) - 8; i < len(raw)-4; i++ {
+		raw[i] = 0x00
+	}
+	if err := os.WriteFile(path, raw, 0644); err != nil {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+
+	reopened, err := NewSSTable(path)
+	if err != nil {
+		t.Fatalf("reopen failed: %v", err)
+	}
+	defer reopened.Close()
+
+	if err := reopened.LoadIndexBlock(); err == nil {
+		t.Errorf("expected LoadIndexBlock to reject bad magic number, got nil err")
+	}
+}
+
+func TestSSTable_LoadIndexBlock_TruncatedFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "truncated.sst")
+
+	if err := os.WriteFile(path, []byte("short"), 0644); err != nil {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+
+	sst, err := NewSSTable(path)
+	if err != nil {
+		t.Fatalf("NewSSTable failed: %v", err)
+	}
+	defer sst.Close()
+
+	if err := sst.LoadIndexBlock(); err == nil {
+		t.Errorf("expected LoadIndexBlock to fail on truncated file, got nil err")
+	}
+}
+
+func TestSSTable_FlushEmptySkiplist(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "empty.sst")
+
+	sl := NewSkiplist()
+
+	sst, err := NewSSTable(path)
+	if err != nil {
+		t.Fatalf("NewSSTable failed: %v", err)
+	}
+	if err := sst.Flush(sl); err != nil {
+		t.Fatalf("Flush of empty skiplist failed: %v", err)
+	}
+	sst.Close()
+
+	reopened, err := NewSSTable(path)
+	if err != nil {
+		t.Fatalf("reopen failed: %v", err)
+	}
+	defer reopened.Close()
+
+	if err := reopened.LoadIndexBlock(); err != nil {
+		t.Fatalf("LoadIndexBlock on empty-skiplist SST failed: %v", err)
+	}
+	if len(reopened.indexEntries) != 0 {
+		t.Errorf("expected 0 index entries for empty skiplist, got %d", len(reopened.indexEntries))
+	}
 }
 
 // END AI SECTION
