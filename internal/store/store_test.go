@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"sync"
 	"testing"
+	"time"
 )
 
 // BEGIN AI SECTION
@@ -18,8 +19,10 @@ func setupStore(t *testing.T, prefix string) (*Store, func()) {
 		t.Fatalf("failed to initialize store: %v", err)
 	}
 
-	// We no longer need to manually delete the file because t.TempDir() handles it!
+	// We no longer need to manually delete the file because t.TempDir() handles it
+	// However, we MUST close the store to release file descriptors on Windows
 	cleanup := func() {
+		_ = s.Close()
 	}
 
 	return s, cleanup
@@ -111,6 +114,47 @@ func TestStore_ConcurrentSetGet(t *testing.T) {
 			}
 		}(i)
 	}
+
+	wg.Wait()
+}
+
+func TestStore_GracefulShutdown_Idempotent(t *testing.T) {
+	s, cleanup := setupStore(t, "close_idempotent")
+	defer cleanup()
+
+	// Calling Close() multiple times should not error or panic
+	err1 := s.Close()
+	err2 := s.Close()
+	err3 := s.Close()
+
+	if err1 != nil || err2 != nil || err3 != nil {
+		t.Fatalf("Expected nil on multiple closes, got: %v, %v, %v", err1, err2, err3)
+	}
+}
+
+func TestStore_GracefulShutdown_PanicProtection(t *testing.T) {
+	s, cleanup := setupStore(t, "close_panic")
+	defer cleanup()
+
+	var wg sync.WaitGroup
+
+	// Use a very large payload (1MB) to force the MemTable to fill up
+	// and trigger the `s.flushChan <- task` branch quickly
+	largeVal := make([]byte, 1024*1024)
+
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			_ = s.Set(fmt.Sprintf("k%d", id), string(largeVal))
+			_ = s.Delete(fmt.Sprintf("k%d", id))
+		}(i)
+	}
+
+	// Wait some time to let some goroutines start their work
+	// before we brutally close the store on them
+	time.Sleep(50 * time.Millisecond)
+	s.Close()
 
 	wg.Wait()
 }

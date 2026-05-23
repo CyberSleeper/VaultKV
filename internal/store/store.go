@@ -38,6 +38,8 @@ type Store struct {
 	flushChan   chan *flushTask
 	mu          sync.RWMutex
 	wal         *WAL
+	flushWg     sync.WaitGroup
+	isClosed    bool
 	OnFlushErr  func(error) // Callback for background flush errors
 }
 
@@ -140,7 +142,7 @@ func NewStore(dir, nodeID string) (*Store, error) {
 		wal:         wal,
 	}
 
-	// TODO: implement graceful shutdown
+	storeObj.flushWg.Add(1)
 	go storeObj.flushWorker()
 
 	return storeObj, nil
@@ -177,7 +179,18 @@ func (s *Store) Set(key, value string) error {
 	// Push to the background worker strictly OUTSIDE the lock
 	// This prevents a Channel-Mutex Deadlock if the flushChan is full
 	if task != nil {
-		s.flushChan <- task
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					if fmt.Sprint(r) == "send on closed channel" {
+						_ = task.wal.Close()
+						return
+					}
+					panic(r)
+				}
+			}()
+			s.flushChan <- task
+		}()
 	}
 
 	return nil
@@ -257,38 +270,8 @@ func (s *Store) getInternal(targetKey string) (string, bool) {
 }
 
 func (s *Store) Delete(key string) error {
-	if s.wal == nil {
-		return errors.New("WAL is not initialized")
-	}
-
-	s.mu.Lock()
-
-	err := s.wal.Append(&LogEntry{
-		Key:   key,
-		Value: tombstone,
-	})
-	if err != nil {
-		s.mu.Unlock()
-		return err
-	}
-
-	s.data.Delete(key)
-
-	var task *flushTask
-	if s.data.IsFull() {
-		task, err = s.flushMemTable()
-		if err != nil {
-			s.mu.Unlock()
-			return err
-		}
-	}
-	s.mu.Unlock()
-
-	if task != nil {
-		s.flushChan <- task
-	}
-
-	return nil
+	// A Delete is just a Set with the TOMBSTONE value
+	return s.Set(key, tombstone)
 }
 
 func (s *Store) flushMemTable() (*flushTask, error) {
@@ -318,6 +301,9 @@ func (s *Store) flushMemTable() (*flushTask, error) {
 }
 
 func (s *Store) flushWorker() {
+	// This signals the wg that this function has done its job
+	defer s.flushWg.Done()
+
 	for task := range s.flushChan {
 		handleErr := func(err error) {
 			if s.OnFlushErr != nil {
@@ -330,7 +316,7 @@ func (s *Store) flushWorker() {
 		var newSst *SSTable
 		var err error
 
-		// We cannot use 'continue' to skip a failed task because it permanently breaks the
+		// We cannot use 'continue' to skip a failed task because it will permanently breaks the
 		// FIFO 1:1 alignment with 's.frozenMemTs', causing the wrong MemTable to be deleted from RAM
 		// If a disk failure occurs, our current solution is to retry until it succeeds to prevent silent data loss
 
@@ -338,7 +324,7 @@ func (s *Store) flushWorker() {
 		// DLQ for the GET query. It will be an anti-pattern to manage this as it's no differ than another Frozen MemTs
 
 		// RocksDB use "Wrtie Stalls" and "ReadOnly Mode" btw, so the current implementation of infinite retry is basically
-		// the step 1 of ghe chanon sol
+		// the step 1 of the canon sol
 
 		for {
 			// Cleanup any partial file from previous attempt
@@ -382,4 +368,34 @@ func (s *Store) flushWorker() {
 		s.sstables = append(s.sstables, newSst)
 		s.mu.Unlock()
 	}
+}
+
+func (s *Store) Close() error {
+	s.mu.Lock()
+	if s.isClosed {
+		s.mu.Unlock()
+		return nil
+	}
+	s.isClosed = true
+	s.mu.Unlock()
+
+	close(s.flushChan)
+
+	s.flushWg.Wait()
+
+	var errs []error
+	if err := s.wal.Close(); err != nil {
+		errs = append(errs, fmt.Errorf("failed to close WAL: %w", err))
+	}
+	for _, sst := range s.sstables {
+		if err := sst.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("failed to close SSTable: %w", err))
+		}
+	}
+
+	if len(errs) > 0 {
+		return errors.Join(errs...)
+	}
+
+	return nil
 }
