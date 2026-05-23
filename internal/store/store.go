@@ -142,7 +142,6 @@ func NewStore(dir, nodeID string) (*Store, error) {
 		wal:         wal,
 	}
 
-	// TODO: implement graceful shutdown
 	storeObj.flushWg.Add(1)
 	go storeObj.flushWorker()
 
