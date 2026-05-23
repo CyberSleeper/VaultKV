@@ -143,30 +143,31 @@ func TestSkiplist_Concurrency_Overlapping(t *testing.T) {
 	wg.Wait()
 }
 
-func TestSkiplist_Delete(t *testing.T) {
+func TestSkiplist_TombstoneStoredAsRegularValue(t *testing.T) {
+	// Skiplist is a dumb sorted-map: it stores tombstones like any other
+	// string value and does not interpret them. Tombstone semantics (masking
+	// older copies of a key across LSM levels) live in the Store layer.
 	sl := NewSkiplist()
 
-	// Set a key
-	sl.Set("key_to_delete", "val1")
-	val, ok := sl.Get("key_to_delete")
+	sl.Set("key", "val1")
+	val, ok := sl.Get("key")
 	if !ok || val != "val1" {
-		t.Fatalf("Expected key_to_delete to exist with val1")
+		t.Fatalf("Expected key to exist with val1, got %q (ok: %v)", val, ok)
 	}
 
-	// Delete the key
-	sl.Delete("key_to_delete")
-
-	// Verify Get returns false
-	val, ok = sl.Get("key_to_delete")
-	if ok || val != "" {
-		t.Errorf("Expected Get to return false and empty string after delete, got %s (ok: %v)", val, ok)
+	// Overwrite with the tombstone sentinel — the skiplist must return it
+	// verbatim, NOT hide it.
+	sl.Set("key", tombstone)
+	val, ok = sl.Get("key")
+	if !ok || val != tombstone {
+		t.Errorf("Expected Get to return the tombstone sentinel verbatim, got %q (ok: %v)", val, ok)
 	}
 
-	// Verify we can resurrect the key
-	sl.Set("key_to_delete", "val2")
-	val, ok = sl.Get("key_to_delete")
+	// Overwriting with a real value resurrects the key
+	sl.Set("key", "val2")
+	val, ok = sl.Get("key")
 	if !ok || val != "val2" {
-		t.Errorf("Expected resurrected key to return val2, got %s (ok: %v)", val, ok)
+		t.Errorf("Expected resurrected key to return val2, got %q (ok: %v)", val, ok)
 	}
 }
 
