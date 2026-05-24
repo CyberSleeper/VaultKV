@@ -106,33 +106,6 @@ func (w *WAL) ReadAll() ([]*LogEntry, error) {
 	return entries, nil
 }
 
-func (w *WAL) Clear() error {
-	if w.file == nil {
-		return fmt.Errorf("wal is closed")
-	}
-
-	// Empty the file
-	if err := w.file.Truncate(0); err != nil {
-		return err
-	}
-
-	// (Crucial Step) When we use os.O_APPEND or normally write to a file,
-	// Go keeps track of an internal "write cursor" (offset). If we only
-	// Truncate(0), the file becomes 0 bytes, but the cursor might still
-	// be at byte 10000. The next time you Append(), it would write 10,000
-	// blank null-bytes first! Seek(0, ...) manually snaps that cursor
-	// safely back to the beginning.
-	if _, err := w.file.Seek(0, io.SeekStart); err != nil {
-		return err
-	}
-
-	if err := w.file.Sync(); err != nil {
-		return err
-	}
-
-	return nil
-}
-
 func (w *WAL) Delete() error {
 	if w.file == nil {
 		return nil
