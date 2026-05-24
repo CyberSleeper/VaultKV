@@ -16,6 +16,13 @@ import (
 
 const memTableSizeThreshold = 4 * 1024 * 1024 // 4MB
 
+// tombstone is the sentinel value the Store writes to mark a key as deleted.
+// It propagates through the active memtable, frozen memtables, and SSTs so
+// that Store.Get can suppress older copies of the key found at lower levels.
+// Skiplist is intentionally unaware of this sentinel — it stores tombstones
+// like any other string value, and the Store layer alone interprets them.
+const tombstone = "0:^_#TOMBSTONE#_^:0"
+
 var validNodeID = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
 
 type Engine interface {
@@ -116,11 +123,9 @@ func NewStore(dir, nodeID string) (*Store, error) {
 		}
 
 		for _, v := range entries {
-			if v.Value == tombstone {
-				data.Delete(v.Key)
-			} else {
-				data.Set(v.Key, v.Value)
-			}
+			// Tombstones are stored verbatim in the memtable, the Store
+			// layer interprets them at Get time.
+			data.Set(v.Key, v.Value)
 		}
 		oldWal.Close()
 	}
@@ -209,10 +214,6 @@ func (s *Store) Get(targetKey string) (string, bool) {
 func (s *Store) getInternal(targetKey string) (string, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	// TODO: query in this exact order:
-	// 1. Active MemTable
-	// 2. Frozen MemTables in order from newest to oldest
-	// 3. SSTables on disk in order from newest to oldest
 
 	// 1. Check Active MemTable
 	if val, exists := s.data.Get(targetKey); exists {

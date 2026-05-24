@@ -8,7 +8,6 @@ const (
 	// probability for each level increment on the new node
 	probability = 0.25
 	maxLevel    = 16
-	tombstone   = "0:^_#TOMBSTONE#_^:0"
 )
 
 type Node struct {
@@ -89,14 +88,10 @@ func (s *Skiplist) Get(k string) (string, bool) {
 	lastNodes := s.getUpdatePath(k)
 	candidate := lastNodes[0].Next[0]
 
-	if candidate != nil && candidate.Key == k && candidate.Value != tombstone {
+	if candidate != nil && candidate.Key == k {
 		return candidate.Value, true
 	}
 	return "", false
-}
-
-func (s *Skiplist) Delete(k string) {
-	s.Set(k, tombstone)
 }
 
 func (s *Skiplist) IsFull() bool {
