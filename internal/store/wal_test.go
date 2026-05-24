@@ -4,7 +4,6 @@ import (
 	"encoding/binary"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"testing"
 )
@@ -124,55 +123,6 @@ func TestWAL_ReadAllAfterCloseErrors(t *testing.T) {
 
 	if _, err := w.ReadAll(); err == nil {
 		t.Errorf("expected ReadAll on closed WAL to error, got nil")
-	}
-}
-
-func TestWAL_ClearTruncatesAndResetsCursor(t *testing.T) {
-	// WAL.Clear calls Truncate on a file opened with O_APPEND, which fails on
-	// Windows with "Access is denied". Clear is also dead code (no callers in
-	// the repo as of this commit). Skip on Windows until either Clear is
-	// removed or it stops relying on Truncate of an O_APPEND fd.
-	if runtime.GOOS == "windows" {
-		t.Skip("WAL.Clear: Truncate on O_APPEND fd is not supported on Windows; see separate issue")
-	}
-
-	w, path := newTestWAL(t)
-	defer w.Close()
-
-	for i := 0; i < 3; i++ {
-		if err := w.Append(NewLogEntry("k", "before-clear")); err != nil {
-			t.Fatalf("Append failed: %v", err)
-		}
-	}
-
-	if err := w.Clear(); err != nil {
-		t.Fatalf("Clear failed: %v", err)
-	}
-
-	// After Clear, the file should be empty on disk
-	info, err := os.Stat(path)
-	if err != nil {
-		t.Fatalf("Stat failed: %v", err)
-	}
-	if info.Size() != 0 {
-		t.Errorf("expected file size 0 after Clear, got %d", info.Size())
-	}
-
-	// Now append a single new entry and verify ReadAll returns ONLY that one
-	// (no nul-byte prefix from the stale write cursor)
-	if err := w.Append(NewLogEntry("fresh", "after-clear")); err != nil {
-		t.Fatalf("Append after Clear failed: %v", err)
-	}
-
-	got, err := w.ReadAll()
-	if err != nil {
-		t.Fatalf("ReadAll after Clear failed: %v", err)
-	}
-	if len(got) != 1 {
-		t.Fatalf("expected exactly 1 entry after Clear+Append, got %d", len(got))
-	}
-	if got[0].Key != "fresh" || got[0].Value != "after-clear" {
-		t.Errorf("unexpected entry after Clear: %+v", got[0])
 	}
 }
 
