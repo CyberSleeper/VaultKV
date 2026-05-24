@@ -1,9 +1,7 @@
 package store
 
 import (
-	"fmt"
 	"strconv"
-	"sync"
 	"testing"
 )
 
@@ -69,79 +67,10 @@ func TestSkiplist_Ordering(t *testing.T) {
 	}
 }
 
-func TestSkiplist_Concurrency(t *testing.T) {
-	sl := NewSkiplist()
-	var wg sync.WaitGroup
-	numGoroutines := 100
-	numOperations := 100
-
-	// Concurrent Writes
-	wg.Add(numGoroutines)
-	for i := range numGoroutines {
-		go func(gID int) {
-			defer wg.Done()
-			for j := range numOperations {
-				key := fmt.Sprintf("key-%d-%d", gID, j)
-				val := fmt.Sprintf("val-%d", j)
-				sl.Set(key, val)
-			}
-		}(i)
-	}
-	wg.Wait()
-
-	// Concurrent Reads
-	wg.Add(numGoroutines)
-	for i := range numGoroutines {
-		go func(gID int) {
-			defer wg.Done()
-			for j := range numOperations {
-				key := fmt.Sprintf("key-%d-%d", gID, j)
-				expectedVal := fmt.Sprintf("val-%d", j)
-
-				val, ok := sl.Get(key)
-				if !ok || val != expectedVal {
-					t.Errorf("Concurrent Read Failed for %s. Expected %s, got %s (ok: %v)", key, expectedVal, val, ok)
-				}
-			}
-		}(i)
-	}
-	wg.Wait()
-}
-
-func TestSkiplist_Concurrency_Overlapping(t *testing.T) {
-	sl := NewSkiplist()
-	var wg sync.WaitGroup
-	numGoroutines := 100
-	numOperations := 100
-
-	// Adding both Writers and Readers to the wait group at once
-	wg.Add(numGoroutines * 2)
-
-	for i := range numGoroutines {
-		go func(gID int) {
-			defer wg.Done()
-			for j := range numOperations {
-				key := fmt.Sprintf("key-%d-%d", gID, j)
-				sl.Set(key, "value")
-			}
-		}(i)
-
-		go func(gID int) {
-			defer wg.Done()
-			for j := range numOperations {
-				key := fmt.Sprintf("key-%d-%d", gID, j)
-
-				// We don't assert the exact value here because the writer
-				// might not have inserted it yet.
-				// We are strictly testing that reading DURING a write
-				// doesn't cause a panic or a fatal memory race!
-				sl.Get(key)
-			}
-		}(i)
-	}
-
-	wg.Wait()
-}
+// Note: Skiplist is documented as not thread-safe; the Store wraps every
+// skiplist access in its own sync.RWMutex. Concurrent-access testing
+// therefore lives at the Store boundary in TestStore_ConcurrentSetGet, not
+// here.
 
 func TestSkiplist_TombstoneStoredAsRegularValue(t *testing.T) {
 	// Skiplist is a dumb sorted-map: it stores tombstones like any other
