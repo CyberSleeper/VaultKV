@@ -17,6 +17,16 @@ type Node struct {
 	level int
 }
 
+// Skiplist is an in-memory sorted-map keyed by string.
+//
+// It is NOT thread-safe. Concurrent Set/Get calls can leave the level pointers
+// in an inconsistent state. Callers must synchronize externally — the Store
+// type does this with its own sync.RWMutex around every skiplist access.
+//
+// Skiplist is also intentionally unaware of tombstone semantics: it stores
+// whatever string value the caller hands it (including the Store's tombstone
+// sentinel) and returns it verbatim. Deletion masking across LSM levels lives
+// in the Store layer, not here.
 type Skiplist struct {
 	SizeBytes int
 	BeginNode *Node
