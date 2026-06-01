@@ -12,8 +12,10 @@ import (
 	"sort"
 	"sync"
 	"time"
+	"vault-kv/internal/worker"
 )
 
+const compactionInterval = 1 * time.Hour
 const memTableSizeThreshold = 4 * 1024 * 1024 // 4MB
 
 // tombstone is the sentinel value the Store writes to mark a key as deleted.
@@ -37,23 +39,28 @@ type flushTask struct {
 }
 
 type Store struct {
-	dir         string
-	nodeId      string
-	data        *Skiplist
-	frozenMemTs []*Skiplist
-	sstables    []*SSTable
-	flushChan   chan *flushTask
-	mu          sync.RWMutex
-	wal         *WAL
-	flushWg     sync.WaitGroup
-	isClosed    bool
-	OnFlushErr  func(error) // Callback for background flush errors
+	dir              string
+	nodeId           string
+	data             *Skiplist
+	frozenMemTs      []*Skiplist
+	sstables         []*SSTable
+	flushChan        chan *flushTask
+	mu               sync.RWMutex
+	wal              *WAL
+	flushWg          sync.WaitGroup
+	isClosed         bool
+	OnFlushErr       func(error) // Callback for background flush errors
+	compactionWorker *worker.CompactionWorker
 }
 
 func NewStore(dir, nodeID string) (*Store, error) {
 	if !validNodeID.MatchString(nodeID) {
 		return nil, fmt.Errorf("invalid nodeID: %q", nodeID)
 	}
+
+	// Initialize workers
+	compactionWorker := worker.NewCompactionWorker(compactionInterval)
+	compactionWorker.Init()
 
 	data := NewSkiplist()
 
@@ -137,14 +144,17 @@ func NewStore(dir, nodeID string) (*Store, error) {
 		return nil, fmt.Errorf("initializing WAL: %w", err)
 	}
 
+	compactionWorker.Run()
+
 	storeObj := &Store{
-		dir:         dir,
-		nodeId:      nodeID,
-		data:        data,
-		frozenMemTs: make([]*Skiplist, 0),
-		sstables:    existingSstables,
-		flushChan:   make(chan *flushTask, 10),
-		wal:         wal,
+		dir:              dir,
+		nodeId:           nodeID,
+		data:             data,
+		frozenMemTs:      make([]*Skiplist, 0),
+		sstables:         existingSstables,
+		flushChan:        make(chan *flushTask, 10),
+		wal:              wal,
+		compactionWorker: compactionWorker,
 	}
 
 	storeObj.flushWg.Add(1)
@@ -383,6 +393,8 @@ func (s *Store) Close() error {
 	close(s.flushChan)
 
 	s.flushWg.Wait()
+
+	s.compactionWorker.Stop()
 
 	var errs []error
 	if err := s.wal.Close(); err != nil {
