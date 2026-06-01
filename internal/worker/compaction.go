@@ -56,4 +56,15 @@ func (c *CompactionWorker) Stop() {
 func (c *CompactionWorker) Compact() {
 	c.wgCompaction.Add(1)
 	defer c.wgCompaction.Done()
+
+	// TODO: implement size-tiered compaction
+	// Current idea
+	// 1. Pass the filenames for those SST we want to compact
+	// 2. Do the K-way merge, it's just like a normal merging but we need to put
+	// all elements from topmost to a heap, this way the complexity is O(N log K)
+	// instead of O(NK) where N is the len of longest SST entries.
+	// 3. Create the compacted SST
+	// 4. Lock the SST and remove the references and files of old SSTs then insert
+	// the resulting SST
+	// 5. Unlock
 }
