@@ -32,14 +32,14 @@ func (c *CompactionWorker) Init() {
 
 func (c *CompactionWorker) Run() {
 	go func() {
+		defer c.ticker.Stop()
 		for {
 			select {
-			case <-c.ticker.C:
-				c.Compact()
 			case <-c.ctx.Done():
 				fmt.Println("Compaction worker stopped")
-				c.ticker.Stop()
 				return
+			case <-c.ticker.C:
+				c.Compact()
 			}
 		}
 	}()
