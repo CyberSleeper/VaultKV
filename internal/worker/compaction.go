@@ -16,21 +16,21 @@ type CompactionWorker struct {
 }
 
 func NewCompactionWorker(interval time.Duration) *CompactionWorker {
+	ticker := time.NewTicker(interval)
+	ctx, cancel := context.WithCancel(context.Background())
+
 	return &CompactionWorker{
-		Interval: interval,
+		Interval:   interval,
+		ticker:     ticker,
+		ctx:        ctx,
+		cancelFunc: cancel,
 	}
 }
 
-func (c *CompactionWorker) Init() {
-	ticker := time.NewTicker(c.Interval)
-	ctx, cancel := context.WithCancel(context.Background())
-
-	c.ticker = ticker
-	c.ctx = ctx
-	c.cancelFunc = cancel
-}
-
 func (c *CompactionWorker) Run() {
+	if c.ticker == nil || c.ctx == nil {
+		panic("Compaction worker not initialized")
+	}
 	go func() {
 		defer c.ticker.Stop()
 		for {

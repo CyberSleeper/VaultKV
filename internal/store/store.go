@@ -58,10 +58,6 @@ func NewStore(dir, nodeID string) (*Store, error) {
 		return nil, fmt.Errorf("invalid nodeID: %q", nodeID)
 	}
 
-	// Initialize workers
-	compactionWorker := worker.NewCompactionWorker(compactionInterval)
-	compactionWorker.Init()
-
 	data := NewSkiplist()
 
 	// Load existing SSTs
@@ -144,6 +140,8 @@ func NewStore(dir, nodeID string) (*Store, error) {
 		return nil, fmt.Errorf("initializing WAL: %w", err)
 	}
 
+	// Initialize workers
+	compactionWorker := worker.NewCompactionWorker(compactionInterval)
 	compactionWorker.Run()
 
 	storeObj := &Store{
