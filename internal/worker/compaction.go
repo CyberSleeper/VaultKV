@@ -13,17 +13,26 @@ type CompactionWorker struct {
 	wgCompaction sync.WaitGroup
 	ticker       *time.Ticker
 	ctx          context.Context
+	compactChan  <-chan int
+	storeManager StoreManager
 }
 
-func NewCompactionWorker(interval time.Duration) *CompactionWorker {
+type StoreManager interface {
+	CheckCompaction(level int)
+	ExecuteCompaction(level int)
+}
+
+func NewCompactionWorker(interval time.Duration, compactChan <-chan int, storeManager StoreManager) *CompactionWorker {
 	ticker := time.NewTicker(interval)
 	ctx, cancel := context.WithCancel(context.Background())
 
 	return &CompactionWorker{
-		Interval:   interval,
-		ticker:     ticker,
-		ctx:        ctx,
-		cancelFunc: cancel,
+		Interval:     interval,
+		ticker:       ticker,
+		ctx:          ctx,
+		cancelFunc:   cancel,
+		compactChan:  compactChan,
+		storeManager: storeManager,
 	}
 }
 
@@ -38,6 +47,8 @@ func (c *CompactionWorker) Run() {
 			case <-c.ctx.Done():
 				fmt.Println("Compaction worker stopped")
 				return
+			case level := <-c.compactChan:
+				c.storeManager.CheckCompaction(level)
 			case <-c.ticker.C:
 				c.Compact()
 			}

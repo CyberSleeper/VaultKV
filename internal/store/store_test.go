@@ -250,6 +250,12 @@ func TestStore_RecoveryFromSST(t *testing.T) {
 		t.Fatalf("Close failed: %v", err)
 	}
 
+	files, _ := os.ReadDir(dir)
+	fmt.Printf("Files in dir %s:\n", dir)
+	for _, f := range files {
+		fmt.Printf("- %s\n", f.Name())
+	}
+
 	// Reopen pointing at the same directory — data must come back from SST
 	s2, err := NewStore(dir, nodeID)
 	if err != nil {
@@ -332,7 +338,7 @@ func TestStore_CorruptedSSTOnStartupErrors(t *testing.T) {
 	nodeID := "corrupt_sst_testnode"
 
 	// Drop a malformed file matching the SST glob
-	badPath := filepath.Join(dir, fmt.Sprintf("vault_%s_1234567890.sst", nodeID))
+	badPath := filepath.Join(dir, fmt.Sprintf("vault_%s_L0_1234567890.sst", nodeID))
 	if err := os.WriteFile(badPath, []byte("definitely not a real sst"), 0644); err != nil {
 		t.Fatalf("WriteFile failed: %v", err)
 	}

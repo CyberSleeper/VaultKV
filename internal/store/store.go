@@ -20,6 +20,10 @@ import (
 const compactionInterval = 1 * time.Hour
 const memTableSizeThreshold = 4 * 1024 * 1024 // 4MB
 
+// Compaction thresholds (Size-Tiered)
+const maxLevel0Files = 4
+const maxLevelFilesMultiplier = 10
+
 // tombstone is the sentinel value the Store writes to mark a key as deleted.
 // It propagates through the active memtable, frozen memtables, and SSTs so
 // that Store.Get can suppress older copies of the key found at lower levels.
@@ -65,7 +69,7 @@ func NewStore(dir, nodeID string) (*Store, error) {
 
 	// Load existing SSTs
 	// vault_<nodeID>_L<level>_<timestamp>.sst
-	sstPattern := filepath.Join(dir, "sst", fmt.Sprintf("vault_%s_*.sst", nodeID))
+	sstPattern := filepath.Join(dir, fmt.Sprintf("vault_%s_*.sst", nodeID))
 	sstFiles, err := filepath.Glob(sstPattern)
 	if err != nil {
 		return nil, fmt.Errorf("failed to scan for old SSTs: %w", err)
@@ -161,21 +165,23 @@ func NewStore(dir, nodeID string) (*Store, error) {
 		return nil, fmt.Errorf("initializing WAL: %w", err)
 	}
 
-	// Initialize workers
-	compactionWorker := worker.NewCompactionWorker(compactionInterval)
-	compactionWorker.Run()
+	compactChan := make(chan int, 100)
 
 	storeObj := &Store{
-		dir:              dir,
-		nodeId:           nodeID,
-		data:             data,
-		frozenMemTs:      make([]*Skiplist, 0),
-		SSTLevels:        existingSstables,
-		flushChan:        make(chan *flushTask, 10),
-		compactChan:      make(chan int, 100),
-		wal:              wal,
-		compactionWorker: compactionWorker,
+		dir:         dir,
+		nodeId:      nodeID,
+		data:        data,
+		frozenMemTs: make([]*Skiplist, 0),
+		SSTLevels:   existingSstables,
+		flushChan:   make(chan *flushTask, 10),
+		compactChan: compactChan,
+		wal:         wal,
 	}
+
+	// Initialize workers
+	compactionWorker := worker.NewCompactionWorker(compactionInterval, compactChan, storeObj)
+	compactionWorker.Run()
+	storeObj.compactionWorker = compactionWorker
 
 	storeObj.flushWg.Add(1)
 	go storeObj.flushWorker()
@@ -357,7 +363,7 @@ func (s *Store) flushMemTable() (*flushTask, error) {
 
 	timestamp := time.Now().UnixNano()
 	newWalName := fmt.Sprintf("vault_%s_%d.wal", s.nodeId, timestamp)
-	newSstName := fmt.Sprintf("vault_%s_%d.sst", s.nodeId, timestamp)
+	newSstName := fmt.Sprintf("vault_%s_L0_%d.sst", s.nodeId, timestamp)
 
 	newWal, err := NewWAL(filepath.Join(s.dir, newWalName))
 	if err != nil {
@@ -455,10 +461,45 @@ func (s *Store) flushWorker() {
 		s.frozenMemTs = s.frozenMemTs[1:]
 
 		curLvl := 0
+		
+		for len(s.SSTLevels) <= curLvl {
+			s.SSTLevels = append(s.SSTLevels, &SSTLevel{
+				LevelNum: len(s.SSTLevels),
+				Tables:   make([]*SST, 0),
+			})
+		}
+		
 		s.SSTLevels[curLvl].Tables = append(s.SSTLevels[curLvl].Tables, newSst)
 		s.compactChan <- curLvl
 		s.mu.Unlock()
 	}
+}
+
+func (s *Store) CheckCompaction(level int) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if level >= len(s.SSTLevels) {
+		return
+	}
+
+	threshold := maxLevel0Files
+	for i := 0; i < level; i++ {
+		threshold *= maxLevelFilesMultiplier
+	}
+
+	if len(s.SSTLevels[level].Tables) >= threshold {
+		// Do not execute compaction directly inside the lock to avoid blocking other operations
+		go s.ExecuteCompaction(level)
+	}
+}
+
+func (s *Store) ExecuteCompaction(level int) {
+	// TODO: Trigger actual compaction worker logic here.
+	// For now, we will just print a log or delegate it to compactionWorker.
+	// The CompactionWorker currently has a Compact() method. We should probably
+	// notify the CompactionWorker to start compacting a specific level instead.
+	fmt.Printf("Triggering compaction for level %d\n", level)
 }
 
 func (s *Store) Close() error {
