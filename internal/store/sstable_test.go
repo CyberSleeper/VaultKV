@@ -122,7 +122,7 @@ func TestSSTable_OnDiskRoundTrip(t *testing.T) {
 	sl.Set("cherry", "crimson")
 
 	// 2. Create + flush the SSTable
-	sst, err := NewSSTable(path)
+	sst, err := NewSST(path)
 	if err != nil {
 		t.Fatalf("NewSSTable failed: %v", err)
 	}
@@ -134,7 +134,7 @@ func TestSSTable_OnDiskRoundTrip(t *testing.T) {
 	}
 
 	// 3. Reopen and load the index block
-	reopened, err := NewSSTable(path)
+	reopened, err := NewSST(path)
 	if err != nil {
 		t.Fatalf("reopen NewSSTable failed: %v", err)
 	}
@@ -151,15 +151,15 @@ func TestSSTable_OnDiskRoundTrip(t *testing.T) {
 
 	expectedKeys := []string{"apple", "banana", "cherry"}
 	for i, want := range expectedKeys {
-		if string(reopened.indexEntries[i].keyBytes) != want {
-			t.Errorf("index[%d]: expected key %q, got %q", i, want, string(reopened.indexEntries[i].keyBytes))
+		if string(reopened.indexEntries[i].KeyBytes) != want {
+			t.Errorf("index[%d]: expected key %q, got %q", i, want, string(reopened.indexEntries[i].KeyBytes))
 		}
 	}
 
 	// 5. Sanity-check: a point read via the pointer we just loaded should land
 	//    on the right record. We replicate the layout the Store uses:
 	//    [keyLen(2)][valLen(4)][key][value]
-	ptr := reopened.indexEntries[1].ptr // "banana"
+	ptr := reopened.indexEntries[1].Ptr // "banana"
 	keyLenBuf := make([]byte, 2)
 	valLenBuf := make([]byte, 4)
 	if _, err := reopened.fd.ReadAt(keyLenBuf, int64(ptr)); err != nil {
@@ -188,7 +188,7 @@ func TestSSTable_LoadIndexBlock_BadMagic(t *testing.T) {
 	sl := NewSkiplist()
 	sl.Set("k", "v")
 
-	sst, err := NewSSTable(path)
+	sst, err := NewSST(path)
 	if err != nil {
 		t.Fatalf("NewSSTable failed: %v", err)
 	}
@@ -212,7 +212,7 @@ func TestSSTable_LoadIndexBlock_BadMagic(t *testing.T) {
 		t.Fatalf("WriteFile failed: %v", err)
 	}
 
-	reopened, err := NewSSTable(path)
+	reopened, err := NewSST(path)
 	if err != nil {
 		t.Fatalf("reopen failed: %v", err)
 	}
@@ -231,7 +231,7 @@ func TestSSTable_LoadIndexBlock_TruncatedFile(t *testing.T) {
 		t.Fatalf("WriteFile failed: %v", err)
 	}
 
-	sst, err := NewSSTable(path)
+	sst, err := NewSST(path)
 	if err != nil {
 		t.Fatalf("NewSSTable failed: %v", err)
 	}
@@ -248,7 +248,7 @@ func TestSSTable_FlushEmptySkiplist(t *testing.T) {
 
 	sl := NewSkiplist()
 
-	sst, err := NewSSTable(path)
+	sst, err := NewSST(path)
 	if err != nil {
 		t.Fatalf("NewSSTable failed: %v", err)
 	}
@@ -257,7 +257,7 @@ func TestSSTable_FlushEmptySkiplist(t *testing.T) {
 	}
 	sst.Close()
 
-	reopened, err := NewSSTable(path)
+	reopened, err := NewSST(path)
 	if err != nil {
 		t.Fatalf("reopen failed: %v", err)
 	}

@@ -10,6 +10,8 @@ import (
 	"regexp"
 	"slices"
 	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 	"vault-kv/internal/worker"
@@ -43,7 +45,7 @@ type Store struct {
 	nodeId           string
 	data             *Skiplist
 	frozenMemTs      []*Skiplist
-	sstables         []*SSTable
+	SSTLevels        []*SSTLevel
 	flushChan        chan *flushTask
 	mu               sync.RWMutex
 	wal              *WAL
@@ -51,6 +53,7 @@ type Store struct {
 	isClosed         bool
 	OnFlushErr       func(error) // Callback for background flush errors
 	compactionWorker *worker.CompactionWorker
+	compactChan      chan int
 }
 
 func NewStore(dir, nodeID string) (*Store, error) {
@@ -61,41 +64,63 @@ func NewStore(dir, nodeID string) (*Store, error) {
 	data := NewSkiplist()
 
 	// Load existing SSTs
-	sstPattern := filepath.Join(dir, fmt.Sprintf("vault_%s_*.sst", nodeID))
+	// vault_<nodeID>_L<level>_<timestamp>.sst
+	sstPattern := filepath.Join(dir, "sst", fmt.Sprintf("vault_%s_*.sst", nodeID))
 	sstFiles, err := filepath.Glob(sstPattern)
 	if err != nil {
 		return nil, fmt.Errorf("failed to scan for old SSTs: %w", err)
 	}
 
-	existingSstables := make([]*SSTable, len(sstFiles))
-
+	existingSstables := make([]*SSTLevel, 0)
 	sort.Strings(sstFiles)
 
-	for i, file := range sstFiles {
-		curSst, err := NewSSTable(file)
+	for _, file := range sstFiles {
+		levelStr, err := extractLevelFromPath(file)
 		if err != nil {
+			closeAllSSTables(existingSstables)
+			return nil, fmt.Errorf("failed to parse level from %s: %w", file, err)
+		}
+		levelNum, err := strconv.Atoi(levelStr)
+
+		if err != nil {
+			closeAllSSTables(existingSstables)
+			return nil, fmt.Errorf("invalid level number in %s: %w", file, err)
+		}
+
+		for len(existingSstables) <= levelNum {
+			existingSstables = append(existingSstables, &SSTLevel{
+				Tables: make([]*SST, 0),
+			})
+		}
+
+		curSst, err := NewSST(file)
+		if err != nil {
+			closeAllSSTables(existingSstables)
 			return nil, fmt.Errorf("failed to open old SST %s: %w", file, err)
 		}
 
 		if err := curSst.LoadIndexBlock(); err != nil {
 			curSst.Close()
-			// Cleanup previously opened files to prevent FD leaks
-			for j := range i {
-				existingSstables[j].Close()
-			}
+			closeAllSSTables(existingSstables)
 			return nil, fmt.Errorf("corrupted SST detected in %s: %w", file, err)
 		}
 
-		existingSstables[i] = curSst
+		existingSstables[levelNum].Tables = append(existingSstables[levelNum].Tables, curSst)
+	}
+
+	for _, level := range existingSstables {
+		if level != nil && len(level.Tables) > 0 {
+			sort.Slice(level.Tables, func(i, j int) bool {
+				return level.Tables[i].filename < level.Tables[j].filename
+			})
+		}
 	}
 
 	// Load data from the existing WALs
 	walPattern := filepath.Join(dir, fmt.Sprintf("vault_%s_*.wal", nodeID))
 	walFiles, err := filepath.Glob(walPattern)
 	if err != nil {
-		for _, sst := range existingSstables {
-			sst.Close()
-		}
+		closeAllSSTables(existingSstables)
 		return nil, fmt.Errorf("failed to scan for old WALs: %w", err)
 	}
 
@@ -110,18 +135,14 @@ func NewStore(dir, nodeID string) (*Store, error) {
 	for _, file := range walFiles {
 		oldWal, err := NewWAL(file)
 		if err != nil {
-			for _, sst := range existingSstables {
-				sst.Close()
-			}
+			closeAllSSTables(existingSstables)
 			return nil, fmt.Errorf("failed to open old WAL %s: %w", file, err)
 		}
 
 		entries, err := oldWal.ReadAll()
 		if err != nil {
 			oldWal.Close()
-			for _, sst := range existingSstables {
-				sst.Close()
-			}
+			closeAllSSTables(existingSstables)
 			return nil, fmt.Errorf("corrupted WAL detected in %s: %w", file, err)
 		}
 
@@ -149,8 +170,9 @@ func NewStore(dir, nodeID string) (*Store, error) {
 		nodeId:           nodeID,
 		data:             data,
 		frozenMemTs:      make([]*Skiplist, 0),
-		sstables:         existingSstables,
+		SSTLevels:        existingSstables,
 		flushChan:        make(chan *flushTask, 10),
+		compactChan:      make(chan int, 100),
 		wal:              wal,
 		compactionWorker: compactionWorker,
 	}
@@ -159,6 +181,25 @@ func NewStore(dir, nodeID string) (*Store, error) {
 	go storeObj.flushWorker()
 
 	return storeObj, nil
+}
+
+// extractLevelFromPath parses strings like "sst/vault_node_east_01_L2_1717670400.sst"
+// and safely returns the level ("2") without using slow regex.
+func extractLevelFromPath(path string) (string, error) {
+	parts := strings.Split(path, "_")
+
+	// A valid path must have at least: sst/vault, nodeID, L<level>, timestamp.sst (4 parts)
+	if len(parts) < 3 {
+		return "", fmt.Errorf("invalid sst file path layout")
+	}
+
+	levelPart := parts[len(parts)-2]
+
+	if len(levelPart) > 1 && levelPart[0] == 'L' {
+		return levelPart[1:], nil
+	}
+
+	return "", fmt.Errorf("could not find level marker 'L' in path: %s", path)
 }
 
 func (s *Store) Set(key, value string) error {
@@ -236,15 +277,17 @@ func (s *Store) getInternal(targetKey string) (string, bool) {
 	}
 
 	// 3. SSTables (newest to oldest)
-	for i := len(s.sstables) - 1; i >= 0; i-- {
-		curSst := s.sstables[i]
+	var foundVal string
+	var isFound bool
+
+	s.ForEachSST(func(lvl int, curSst *SST) bool {
 		targetBytes := []byte(targetKey)
 		idx, found := slices.BinarySearchFunc(curSst.indexEntries, targetBytes, func(entry *IndexBlockEntry, target []byte) int {
-			return bytes.Compare(entry.keyBytes, target)
+			return bytes.Compare(entry.KeyBytes, target)
 		})
 
 		if found {
-			exactPtr := curSst.indexEntries[idx].ptr
+			exactPtr := curSst.indexEntries[idx].Ptr
 			keyLen := len(targetKey)
 
 			// Note: Do not use fd.Seek as it will change the global fd, which will ofc
@@ -258,7 +301,7 @@ func (s *Store) getInternal(targetKey string) (string, bool) {
 			// The 4-byte valLen is located right after keyLen (exactPtr + 2).
 			valLenBytes := make([]byte, 4)
 			if _, err := curSst.fd.ReadAt(valLenBytes, int64(exactPtr+2)); err != nil {
-				return "", false
+				return true
 			}
 			valLen := binary.LittleEndian.Uint32(valLenBytes)
 
@@ -268,14 +311,36 @@ func (s *Store) getInternal(targetKey string) (string, bool) {
 
 			valBytes := make([]byte, valLen)
 			if _, err := curSst.fd.ReadAt(valBytes, valOffset); err != nil {
-				return "", false
+				return true
 			}
 
-			return string(valBytes), true
+			foundVal = string(valBytes)
+			isFound = true
+			return false
+		}
+
+		return true
+	})
+
+	return foundVal, isFound
+}
+
+// ForEachSST iterates over all SSTables in the store.
+// It iterates from the lowest level (L0) to the highest, and within each level,
+// from the newest SSTable to the oldest.
+// The callback returns false to stop the iteration.
+// Note: The caller must hold the RLock on the Store's mutex.
+func (s *Store) ForEachSST(cb func(lvl int, sst *SST) bool) {
+	for _, level := range s.SSTLevels {
+		if level == nil {
+			continue
+		}
+		for i := len(level.Tables) - 1; i >= 0; i-- {
+			if !cb(level.LevelNum, level.Tables[i]) {
+				return
+			}
 		}
 	}
-
-	return "", false
 }
 
 func (s *Store) Delete(key string) error {
@@ -283,6 +348,11 @@ func (s *Store) Delete(key string) error {
 	return s.Set(key, tombstone)
 }
 
+// flushMemTable freezes the active memtable and its corresponding WAL, appending
+// the memtable to the frozen list so it remains queryable. It then initializes a
+// new active memtable and WAL to accept incoming writes. It returns a flushTask
+// containing the frozen data to be processed by the background flush worker.
+// The caller must hold the Store's write lock before invoking this function.
 func (s *Store) flushMemTable() (*flushTask, error) {
 
 	timestamp := time.Now().UnixNano()
@@ -299,6 +369,8 @@ func (s *Store) flushMemTable() (*flushTask, error) {
 
 	// Freeze the memtable so it can still be queried during the flush
 	s.frozenMemTs = append(s.frozenMemTs, frozenData)
+
+	// Replcae the current memt n wal with the new one
 	s.data = NewSkiplist()
 	s.wal = newWal
 
@@ -309,6 +381,13 @@ func (s *Store) flushMemTable() (*flushTask, error) {
 	}, nil
 }
 
+// flushWorker is a long-running background goroutine that sequentially processes
+// flushTasks from the Store's flush channel. For each task, it writes the frozen
+// memtable's data to a new SSTable on disk, loads the SSTable's index, and cleans up
+// the obsolete WAL file. In the event of a disk or write error, it will infinitely
+// retry the flush operation to prevent silent data loss and maintain the FIFO
+// sequence of frozen memtables. Upon success, it locks the Store to append the new
+// SSTable to the active list and safely removes the flushed memtable from memory.
 func (s *Store) flushWorker() {
 	// This signals the wg that this function has done its job
 	defer s.flushWg.Done()
@@ -322,14 +401,14 @@ func (s *Store) flushWorker() {
 			}
 		}
 
-		var newSst *SSTable
+		var newSst *SST
 		var err error
 
 		// We cannot use 'continue' to skip a failed task because it will permanently breaks the
 		// FIFO 1:1 alignment with 's.frozenMemTs', causing the wrong MemTable to be deleted from RAM
 		// If a disk failure occurs, our current solution is to retry until it succeeds to prevent silent data loss
 
-		// U might think ofa solution like DLQ, but then we need to think on how to scan through this
+		// U might think of a solution like DLQ, but then we need to think on how to scan through this
 		// DLQ for the GET query. It will be an anti-pattern to manage this as it's no differ than another Frozen MemTs
 
 		// RocksDB use "Wrtie Stalls" and "ReadOnly Mode" btw, so the current implementation of infinite retry is basically
@@ -339,7 +418,7 @@ func (s *Store) flushWorker() {
 			// Cleanup any partial file from previous attempt
 			_ = os.Remove(filepath.Join(s.dir, task.sstName))
 
-			newSst, err = NewSSTable(filepath.Join(s.dir, task.sstName))
+			newSst, err = NewSST(filepath.Join(s.dir, task.sstName))
 			if err != nil {
 				handleErr(fmt.Errorf("failed to create new SSTable: %w", err))
 				time.Sleep(1 * time.Second)
@@ -374,7 +453,10 @@ func (s *Store) flushWorker() {
 		s.mu.Lock()
 		s.frozenMemTs[0] = nil // Avoid memory leak, tell GC to sweep it
 		s.frozenMemTs = s.frozenMemTs[1:]
-		s.sstables = append(s.sstables, newSst)
+
+		curLvl := 0
+		s.SSTLevels[curLvl].Tables = append(s.SSTLevels[curLvl].Tables, newSst)
+		s.compactChan <- curLvl
 		s.mu.Unlock()
 	}
 }
@@ -398,11 +480,12 @@ func (s *Store) Close() error {
 	if err := s.wal.Close(); err != nil {
 		errs = append(errs, fmt.Errorf("failed to close WAL: %w", err))
 	}
-	for _, sst := range s.sstables {
+	s.ForEachSST(func(lvl int, sst *SST) bool {
 		if err := sst.Close(); err != nil {
 			errs = append(errs, fmt.Errorf("failed to close SSTable: %w", err))
 		}
-	}
+		return true
+	})
 
 	if len(errs) > 0 {
 		return errors.Join(errs...)

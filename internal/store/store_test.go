@@ -169,7 +169,12 @@ func waitForFlush(t *testing.T, s *Store, minSSTs int) {
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		s.mu.RLock()
-		nSST := len(s.sstables)
+		nSST := 0
+		for _, lvl := range s.SSTLevels {
+			if lvl != nil {
+				nSST += len(lvl.Tables)
+			}
+		}
 		nFrozen := len(s.frozenMemTs)
 		s.mu.RUnlock()
 		if nSST >= minSSTs && nFrozen == 0 {
@@ -179,8 +184,16 @@ func waitForFlush(t *testing.T, s *Store, minSSTs int) {
 	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+
+	nSST := 0
+	for _, lvl := range s.SSTLevels {
+		if lvl != nil {
+			nSST += len(lvl.Tables)
+		}
+	}
+
 	t.Fatalf("flush did not complete: ssts=%d (want >=%d), frozen=%d (want 0)",
-		len(s.sstables), minSSTs, len(s.frozenMemTs))
+		nSST, minSSTs, len(s.frozenMemTs))
 }
 
 // forceFlush writes enough 1MB blobs to exceed the 4MB memtable threshold and
@@ -244,7 +257,13 @@ func TestStore_RecoveryFromSST(t *testing.T) {
 	}
 	defer s2.Close()
 
-	if len(s2.sstables) == 0 {
+	nSST2 := 0
+	for _, lvl := range s2.SSTLevels {
+		if lvl != nil {
+			nSST2 += len(lvl.Tables)
+		}
+	}
+	if nSST2 == 0 {
 		t.Fatalf("expected recovered store to load at least 1 SSTable, got 0")
 	}
 

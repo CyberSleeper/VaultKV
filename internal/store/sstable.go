@@ -14,23 +14,48 @@ const maxEntryCntBytes = math.MaxUint16
 
 const magicNumber uint32 = 0xCAFEBABE
 
-// SSTable represents a single .sst file
-type SSTable struct {
+type SSTLevel struct {
+	LevelNum int
+	Tables   []*SST
+}
+
+// SST represents a single .sst file
+type SST struct {
 	fd           *os.File
 	filename     string
 	indexEntries []*IndexBlockEntry
 }
 
-type SSTableEntry struct {
+type SSTEntry struct {
 	LogEntries []*LogEntry
 }
 
 type IndexBlockEntry struct {
-	ptr      uint32
-	keyBytes []byte
+	Ptr      uint32
+	KeyBytes []byte
 }
 
-func (s *SSTable) Close() error {
+func closeAllSSTables(levels []*SSTLevel) {
+	for _, lvl := range levels {
+		if lvl != nil {
+			lvl.Close()
+		}
+	}
+}
+
+func (s *SSTLevel) Close() error {
+	var firstErr error
+	for _, v := range s.Tables {
+		if v != nil {
+			if err := v.Close(); err != nil && firstErr == nil {
+				firstErr = err
+			}
+		}
+	}
+	return firstErr
+}
+
+func (s *SST) Close() error {
 	var firstErr error
 
 	if s.fd != nil {
@@ -47,13 +72,13 @@ type indexEntry struct {
 	key     string
 }
 
-func NewSSTable(path string) (*SSTable, error) {
+func NewSST(path string) (*SST, error) {
 	file, err := os.OpenFile(path, os.O_RDWR|os.O_APPEND|os.O_CREATE, 0644)
 	if err != nil {
 		return nil, err
 	}
 
-	sstable := &SSTable{
+	sstable := &SST{
 		fd:           file,
 		filename:     path,
 		indexEntries: make([]*IndexBlockEntry, 0),
@@ -61,13 +86,13 @@ func NewSSTable(path string) (*SSTable, error) {
 	return sstable, nil
 }
 
-func NewSSTableEntry() *SSTableEntry {
-	return &SSTableEntry{
+func NewSSTableEntry() *SSTEntry {
+	return &SSTEntry{
 		LogEntries: make([]*LogEntry, 0),
 	}
 }
 
-func (s *SSTable) MergeSkiplist(skiplist *Skiplist) *SSTableEntry {
+func (s *SST) MergeSkiplist(skiplist *Skiplist) *SSTEntry {
 	sstableEntry := NewSSTableEntry()
 
 	// Skip the dummy header node and start at the first real data node
@@ -81,7 +106,7 @@ func (s *SSTable) MergeSkiplist(skiplist *Skiplist) *SSTableEntry {
 	return sstableEntry
 }
 
-func (s *SSTable) Append(entry *SSTableEntry) error {
+func (s *SST) Append(entry *SSTEntry) error {
 	if entry == nil {
 		return fmt.Errorf("nil sst entry")
 	}
@@ -99,7 +124,7 @@ func (s *SSTable) Append(entry *SSTableEntry) error {
 	return nil
 }
 
-func (s *SSTable) Flush(skiplist *Skiplist) error {
+func (s *SST) Flush(skiplist *Skiplist) error {
 	sstEntry := s.MergeSkiplist(skiplist)
 
 	if err := s.Append(sstEntry); err != nil {
@@ -108,14 +133,7 @@ func (s *SSTable) Flush(skiplist *Skiplist) error {
 	return nil
 }
 
-// Compaction need 1 argumen, that is the target SST Level.
-// If the target lvl is 0, that means it will flush the
-// Skiplist first
-func (s *SSTable) Compaction(toLevel int) {
-	// TODO
-}
-
-func (e *SSTableEntry) Encode(w io.Writer) error {
+func (e *SSTEntry) Encode(w io.Writer) error {
 	if len(e.LogEntries) > int(maxEntryCntBytes) {
 		return fmt.Errorf("entry length too large: %d, limit=%d", len(e.LogEntries), maxEntryCntBytes)
 	}
@@ -205,7 +223,7 @@ func (e *SSTableEntry) Encode(w io.Writer) error {
 	return nil
 }
 
-func (e *SSTableEntry) Decode(r io.Reader) error {
+func (e *SSTEntry) Decode(r io.Reader) error {
 	var dataLen uint16
 
 	var buf bytes.Buffer
@@ -322,7 +340,7 @@ func (e *SSTableEntry) Decode(r io.Reader) error {
 	return nil
 }
 
-func (e *SSTable) LoadIndexBlock() error {
+func (e *SST) LoadIndexBlock() error {
 	// 1. Jump straight to the Footer (last 12 bytes of the file)
 	// (IndexOffset: 4 bytes, MagicNumber: 4 bytes, Checksum: 4 bytes)
 
@@ -371,7 +389,7 @@ func (e *SSTable) LoadIndexBlock() error {
 
 	for {
 		var entry IndexBlockEntry
-		err := binary.Read(limitReader, binary.LittleEndian, &entry.ptr)
+		err := binary.Read(limitReader, binary.LittleEndian, &entry.Ptr)
 		if err == io.EOF {
 			break
 		}
@@ -384,8 +402,8 @@ func (e *SSTable) LoadIndexBlock() error {
 			return err
 		}
 
-		entry.keyBytes = make([]byte, keyLen)
-		if _, err := io.ReadFull(limitReader, entry.keyBytes); err != nil {
+		entry.KeyBytes = make([]byte, keyLen)
+		if _, err := io.ReadFull(limitReader, entry.KeyBytes); err != nil {
 			return err
 		}
 
