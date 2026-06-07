@@ -134,92 +134,144 @@ func (s *SST) Flush(skiplist *Skiplist) error {
 }
 
 func (e *SSTEntry) Encode(w io.Writer) error {
-	if len(e.LogEntries) > int(maxEntryCntBytes) {
-		return fmt.Errorf("entry length too large: %d, limit=%d", len(e.LogEntries), maxEntryCntBytes)
-	}
+	var indexSlice []indexEntry
+	var currentBlockBuf bytes.Buffer
+	var fileOffset uint32
 
-	var dataLen uint16
-	dataLen = uint16(len(e.LogEntries))
+	targetBlockSize := 4096 // 4KB target block size
 
-	var buf bytes.Buffer
+	// Keep track of the first key in the current block for the sparse index
+	var firstKeyInBlock string
+	var entriesInBlock uint16
 
-	if err := binary.Write(&buf, binary.LittleEndian, dataLen); err != nil {
-		return err
-	}
-
-	indexSlice := make([]indexEntry, dataLen)
-
-	for i, v := range e.LogEntries {
+	for _, v := range e.LogEntries {
 		if len(v.Key) > math.MaxUint16 {
 			return fmt.Errorf("key too long: %d bytes, max %d", len(v.Key), math.MaxUint16)
 		}
 		if len(v.Value) > math.MaxUint32 {
 			return fmt.Errorf("value too long: %d bytes, max %d", len(v.Value), math.MaxUint32)
 		}
+
+		if entriesInBlock == 0 {
+			firstKeyInBlock = v.Key
+		}
+
 		keyLen := uint16(len(v.Key))
 		valLen := uint32(len(v.Value))
 
-		indexSlice[i] = indexEntry{
-			pointer: uint32(buf.Len()),
-			keyLen:  keyLen,
-			key:     v.Key,
+		// Temporarily write the entry to the current block buffer
+		if err := binary.Write(&currentBlockBuf, binary.LittleEndian, keyLen); err != nil {
+			return err
+		}
+		if err := binary.Write(&currentBlockBuf, binary.LittleEndian, valLen); err != nil {
+			return err
+		}
+		if _, err := currentBlockBuf.Write([]byte(v.Key)); err != nil {
+			return err
+		}
+		if _, err := currentBlockBuf.Write([]byte(v.Value)); err != nil {
+			return err
 		}
 
-		if err := binary.Write(&buf, binary.LittleEndian, keyLen); err != nil {
-			return err
+		entriesInBlock++
+
+		// If the block has reached the target size, flush it to disk
+		if currentBlockBuf.Len() >= targetBlockSize {
+			if err := flushBlock(&currentBlockBuf, w, &fileOffset, &indexSlice, firstKeyInBlock, entriesInBlock); err != nil {
+				return err
+			}
+			entriesInBlock = 0
 		}
-		if err := binary.Write(&buf, binary.LittleEndian, valLen); err != nil {
-			return err
-		}
-		if _, err := buf.Write([]byte(v.Key)); err != nil {
-			return err
-		}
-		if _, err := buf.Write([]byte(v.Value)); err != nil {
+	}
+
+	// Flush any remaining entries in the last block
+	if currentBlockBuf.Len() > 0 {
+		if err := flushBlock(&currentBlockBuf, w, &fileOffset, &indexSlice, firstKeyInBlock, entriesInBlock); err != nil {
 			return err
 		}
 	}
 
-	// The Trailer Index Block starts from buf.Len()
-	indexOffset := uint32(buf.Len())
+	// The Trailer Index Block starts here
+	indexOffset := fileOffset
 
-	// Index Block
+	var indexBuf bytes.Buffer
+	
+	// Write the number of index entries
+	numIndexEntries := uint32(len(indexSlice))
+	if err := binary.Write(&indexBuf, binary.LittleEndian, numIndexEntries); err != nil {
+		return err
+	}
+
+	// Write Index Block (Sparse Index)
 	for _, v := range indexSlice {
-		if err := binary.Write(&buf, binary.LittleEndian, v.pointer); err != nil {
+		if err := binary.Write(&indexBuf, binary.LittleEndian, v.pointer); err != nil {
 			return err
 		}
-		if err := binary.Write(&buf, binary.LittleEndian, v.keyLen); err != nil {
+		if err := binary.Write(&indexBuf, binary.LittleEndian, v.keyLen); err != nil {
 			return err
 		}
-		if _, err := buf.Write([]byte(v.key)); err != nil {
+		if _, err := indexBuf.Write([]byte(v.key)); err != nil {
 			return err
 		}
 	}
-
-	// Write Footer directly into buf!
-	if err := binary.Write(&buf, binary.LittleEndian, indexOffset); err != nil {
+	
+	indexData := indexBuf.Bytes()
+	indexChecksum := crc32.ChecksumIEEE(indexData)
+	
+	// Write Index Data
+	if _, err := w.Write(indexData); err != nil {
 		return err
 	}
-	if err := binary.Write(&buf, binary.LittleEndian, magicNumber); err != nil {
+	
+	// Write Index Checksum
+	if err := binary.Write(w, binary.LittleEndian, indexChecksum); err != nil {
 		return err
 	}
 
-	data := buf.Bytes()
+	// Write Footer (IndexOffset, MagicNumber)
+	if err := binary.Write(w, binary.LittleEndian, indexOffset); err != nil {
+		return err
+	}
+	if err := binary.Write(w, binary.LittleEndian, magicNumber); err != nil {
+		return err
+	}
 
-	// TODO(Future Improvement):
-	// Currently, this writes a single Master Checksum over the entire SSTable file at the EOF
-	// For production-grade durability against single-bit flips, consider rotating to
-	// Block-Based Checksums (calculating and inserting a checksum every 4KB of data chunked)
-	// to prevent a 1-byte corruption from invalidating the entire file
-	checksum := crc32.ChecksumIEEE(data)
+	return nil
+}
 
-	// Write everything to disk, and Checksum at the absolute end
-	if _, err := w.Write(data); err != nil {
+func flushBlock(buf *bytes.Buffer, w io.Writer, fileOffset *uint32, indexSlice *[]indexEntry, firstKey string, numEntries uint16) error {
+	blockData := buf.Bytes()
+	
+	// Calculate block checksum (covering numEntries + data)
+	// We prepend numEntries to the buffer logically for checksum, but write it separately
+	var checksumBuf bytes.Buffer
+	binary.Write(&checksumBuf, binary.LittleEndian, numEntries)
+	checksumBuf.Write(blockData)
+	checksum := crc32.ChecksumIEEE(checksumBuf.Bytes())
+
+	// Write numEntries, Data, and Checksum to disk
+	if err := binary.Write(w, binary.LittleEndian, numEntries); err != nil {
+		return err
+	}
+	if _, err := w.Write(blockData); err != nil {
 		return err
 	}
 	if err := binary.Write(w, binary.LittleEndian, checksum); err != nil {
 		return err
 	}
 
+	// Add sparse index entry pointing to the START of this block
+	*indexSlice = append(*indexSlice, indexEntry{
+		pointer: *fileOffset,
+		keyLen:  uint16(len(firstKey)),
+		key:     firstKey,
+	})
+
+	// Advance fileOffset: 2 bytes (numEntries) + len(data) + 4 bytes (checksum)
+	*fileOffset += 2 + uint32(len(blockData)) + 4
+
+	// Reset buffer for the next block
+	buf.Reset()
 	return nil
 }
 

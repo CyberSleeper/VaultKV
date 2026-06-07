@@ -484,12 +484,11 @@ func (s *Store) CheckCompaction(level int) {
 	}
 
 	threshold := maxLevel0Files
-	for i := 0; i < level; i++ {
+	for range level {
 		threshold *= maxLevelFilesMultiplier
 	}
 
 	if len(s.SSTLevels[level].Tables) >= threshold {
-		// Do not execute compaction directly inside the lock to avoid blocking other operations
 		go s.ExecuteCompaction(level)
 	}
 }

@@ -52,7 +52,7 @@ func (c *CompactionWorker) Run() {
 			case <-c.ticker.C:
 				c.Compact()
 			}
-		}
+		} 
 	}()
 }
 
