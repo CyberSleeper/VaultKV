@@ -10,68 +10,66 @@ import (
 
 // BEGIN AI SECTION
 
-func TestSSTable_Option3_Format(t *testing.T) {
-	// Create a dummy memtable flush event with 2 exact items
+func TestSSTable_BlockFormat(t *testing.T) {
+	// Two small entries fit comfortably inside a single ~4KB data block, so the
+	// sparse index should hold exactly one entry pointing at the start of that
+	// block (offset 0). The footer layout is:
+	//   [indexChecksum(4)][indexOffset(4)][magicNumber(4)]
 	entry := NewSSTableEntry()
 	entry.LogEntries = append(entry.LogEntries, NewLogEntry("apple", "red"))
 	entry.LogEntries = append(entry.LogEntries, NewLogEntry("banana", "yellow"))
 
 	var buf bytes.Buffer
-	err := entry.Encode(&buf)
-	if err != nil {
+	if err := entry.Encode(&buf); err != nil {
 		t.Fatalf("Encode failed: %v", err)
 	}
-
 	data := buf.Bytes()
 
-	// Checkpoint 1: Minimum Size
-	// Footer (8) + checksum (4) + KV count (2) = minimum 14 bytes
-	if len(data) < 14 {
-		t.Fatalf("Encoded data too small: %d bytes (Did you write the footer?)", len(data))
+	// Checkpoint 1: minimum size — at least one block + index + footer
+	if len(data) < 12 {
+		t.Fatalf("Encoded data too small: %d bytes", len(data))
 	}
-	t.Log("✅ Checkpoint 1 Passed: Minimum file size met!")
 
-	// Checkpoint 2: Validate the Top-Level Header (KV Cnt)
-	// Because Option 3 puts KV cnt at the very start now (Checksum moved):
-	kvCnt := binary.LittleEndian.Uint16(data[0:2])
-	if kvCnt != 2 {
-		t.Fatalf("Checkpoint 2 Failed! Expected top-level KV Cnt of 2, got %d. Did you structure the start correctly?", kvCnt)
+	// Checkpoint 2: the first data block begins with numEntries == 2
+	blockNumEntries := binary.LittleEndian.Uint16(data[0:2])
+	if blockNumEntries != 2 {
+		t.Fatalf("expected first block to hold 2 entries, got %d", blockNumEntries)
 	}
-	t.Log("✅ Checkpoint 2 Passed: KV Cnt Header is correct!")
 
-	// Checkpoint 3: Validate the Checksum AND Footer Magic Number
-	// The file ends with: [IndexOffset 4B][MagicNum 4B][Checksum 4B]
+	// Checkpoint 3: magic number occupies the final 4 bytes
 	footerStart := len(data) - 12
-
-	magicNum := binary.LittleEndian.Uint32(data[footerStart+4 : footerStart+8])
-	expectedMagic := uint32(0xCAFEBABE)
-	if magicNum != expectedMagic {
-		t.Fatalf("Checkpoint 3 Failed! Expected magic number 0x%X in Footer, got 0x%X.", expectedMagic, magicNum)
+	magicNum := binary.LittleEndian.Uint32(data[footerStart+8 : footerStart+12])
+	if magicNum != magicNumber {
+		t.Fatalf("expected magic 0x%X at end of footer, got 0x%X", magicNumber, magicNum)
 	}
-	t.Log("✅ Checkpoint 3 Passed: Magic Number matches right before EOF Checksum!")
 
-	// Checkpoint 4: Validate the Index Offset Points to real data!
-	indexOffset := binary.LittleEndian.Uint32(data[footerStart : footerStart+4])
-	if indexOffset == 0 || indexOffset >= uint32(footerStart) {
-		t.Fatalf("Checkpoint 4 Failed! Index offset %d is invalid or overlapping.", indexOffset)
+	// Checkpoint 4: index offset is the middle 4 bytes of the footer and points
+	// inside the file
+	indexOffset := binary.LittleEndian.Uint32(data[footerStart+4 : footerStart+8])
+	if int(indexOffset) > footerStart {
+		t.Fatalf("index offset %d overlaps footer at %d", indexOffset, footerStart)
 	}
-	t.Logf("✅ Checkpoint 4 Passed: Index offset successfully extracted: points to byte %d!", indexOffset)
 
-	// Checkpoint 5: Verify the first Index
+	// Checkpoint 5: index checksum (first 4 footer bytes) verifies over the
+	// index region AND the indexOffset footer field
+	indexChecksum := binary.LittleEndian.Uint32(data[footerStart : footerStart+4])
+	if indexBlockChecksum(data[indexOffset:footerStart], indexOffset) != indexChecksum {
+		t.Fatalf("index checksum mismatch")
+	}
+
+	// Checkpoint 6: index has exactly one entry, pointing at block offset 0
 	indexData := data[indexOffset:footerStart]
-	if len(indexData) < 6 {
-		t.Fatalf("Checkpoint 5 Failed! Index block is missing or too small.")
+	numIndexEntries := binary.LittleEndian.Uint32(indexData[0:4])
+	if numIndexEntries != 1 {
+		t.Fatalf("expected 1 sparse index entry, got %d", numIndexEntries)
 	}
-
-	// Read the first Location from the Index
-	firstLocation := binary.LittleEndian.Uint32(indexData[0:4])
-	if firstLocation != 2 { // Since Data block starts exactly after KVCnt(2) = Byte 2!
-		t.Fatalf("Checkpoint 5 Failed! Expected first Data block to be at byte 2, but index points to %d", firstLocation)
+	firstPtr := binary.LittleEndian.Uint32(indexData[4:8])
+	if firstPtr != 0 {
+		t.Fatalf("expected first block pointer at byte 0, got %d", firstPtr)
 	}
-	t.Log("✅ Checkpoint 5 Passed: The Index block accurately points to the first Data block! Everything is mathematically flawless.")
 }
 
-func TestSSTable_Decode_Option3(t *testing.T) {
+func TestSSTable_DecodeRoundTrip(t *testing.T) {
 	// 1. Create original source of truth
 	original := NewSSTableEntry()
 	original.LogEntries = append(original.LogEntries, NewLogEntry("hello", "world"))
@@ -144,40 +142,32 @@ func TestSSTable_OnDiskRoundTrip(t *testing.T) {
 		t.Fatalf("LoadIndexBlock failed: %v", err)
 	}
 
-	// 4. Verify index has the right number of entries in sorted order
-	if len(reopened.indexEntries) != 3 {
-		t.Fatalf("expected 3 index entries, got %d", len(reopened.indexEntries))
+	// 4. The sparse index holds one entry PER BLOCK, not per key. These three
+	//    small entries fit in a single ~4KB block, so we expect exactly one
+	//    index entry whose key is the first key in the block ("apple").
+	if len(reopened.indexEntries) != 1 {
+		t.Fatalf("expected 1 sparse index entry, got %d", len(reopened.indexEntries))
+	}
+	if got := string(reopened.indexEntries[0].KeyBytes); got != "apple" {
+		t.Errorf("expected first-key 'apple' in sparse index, got %q", got)
 	}
 
-	expectedKeys := []string{"apple", "banana", "cherry"}
-	for i, want := range expectedKeys {
-		if string(reopened.indexEntries[i].KeyBytes) != want {
-			t.Errorf("index[%d]: expected key %q, got %q", i, want, string(reopened.indexEntries[i].KeyBytes))
+	// 5. Every key must be retrievable through the real lookup path
+	//    (sparse-index search -> block read -> CRC verify -> scan).
+	cases := map[string]string{"apple": "red", "banana": "yellow", "cherry": "crimson"}
+	for k, want := range cases {
+		val, found, err := reopened.lookup(k)
+		if err != nil {
+			t.Fatalf("lookup(%q) errored: %v", k, err)
+		}
+		if !found || val != want {
+			t.Errorf("lookup(%q): got (%q, %v), want (%q, true)", k, val, found, want)
 		}
 	}
 
-	// 5. Sanity-check: a point read via the pointer we just loaded should land
-	//    on the right record. We replicate the layout the Store uses:
-	//    [keyLen(2)][valLen(4)][key][value]
-	ptr := reopened.indexEntries[1].Ptr // "banana"
-	keyLenBuf := make([]byte, 2)
-	valLenBuf := make([]byte, 4)
-	if _, err := reopened.fd.ReadAt(keyLenBuf, int64(ptr)); err != nil {
-		t.Fatalf("ReadAt keyLen failed: %v", err)
-	}
-	if _, err := reopened.fd.ReadAt(valLenBuf, int64(ptr)+2); err != nil {
-		t.Fatalf("ReadAt valLen failed: %v", err)
-	}
-	keyLen := binary.LittleEndian.Uint16(keyLenBuf)
-	valLen := binary.LittleEndian.Uint32(valLenBuf)
-
-	valBytes := make([]byte, valLen)
-	valOffset := int64(ptr) + 2 + 4 + int64(keyLen)
-	if _, err := reopened.fd.ReadAt(valBytes, valOffset); err != nil {
-		t.Fatalf("ReadAt val failed: %v", err)
-	}
-	if string(valBytes) != "yellow" {
-		t.Errorf("expected value 'yellow' at index[1], got %q", string(valBytes))
+	// 6. A key that was never inserted must report not-found cleanly
+	if _, found, err := reopened.lookup("durian"); err != nil || found {
+		t.Errorf("lookup(durian): expected (_, false, nil), got (found=%v, err=%v)", found, err)
 	}
 }
 
@@ -197,15 +187,16 @@ func TestSSTable_LoadIndexBlock_BadMagic(t *testing.T) {
 	}
 	sst.Close()
 
-	// Corrupt the magic number (bytes [size-8, size-4))
+	// Corrupt the magic number, which now occupies the final 4 bytes of the
+	// footer: [indexChecksum(4)][indexOffset(4)][magicNumber(4)]
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("ReadFile failed: %v", err)
 	}
-	if len(raw) < 8 {
+	if len(raw) < 12 {
 		t.Fatalf("SST file too small: %d", len(raw))
 	}
-	for i := len(raw) - 8; i < len(raw)-4; i++ {
+	for i := len(raw) - 4; i < len(raw); i++ {
 		raw[i] = 0x00
 	}
 	if err := os.WriteFile(path, raw, 0644); err != nil {
@@ -220,6 +211,49 @@ func TestSSTable_LoadIndexBlock_BadMagic(t *testing.T) {
 
 	if err := reopened.LoadIndexBlock(); err == nil {
 		t.Errorf("expected LoadIndexBlock to reject bad magic number, got nil err")
+	}
+}
+
+func TestSSTable_LoadIndexBlock_CorruptedIndexOffset(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "bad_offset.sst")
+
+	sl := NewSkiplist()
+	sl.Set("k", "v")
+
+	sst, err := NewSST(path)
+	if err != nil {
+		t.Fatalf("NewSST failed: %v", err)
+	}
+	if err := sst.Flush(sl); err != nil {
+		t.Fatalf("Flush failed: %v", err)
+	}
+	sst.Close()
+
+	// indexOffset is the middle 4 bytes of the footer:
+	// [indexChecksum(4)][indexOffset(4)][magicNumber(4)]. Flip its low byte so
+	// it still points inside the file but no longer matches what the index
+	// checksum was computed against.
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile failed: %v", err)
+	}
+	if len(raw) < 12 {
+		t.Fatalf("SST file too small: %d", len(raw))
+	}
+	raw[len(raw)-8] ^= 0x01
+	if err := os.WriteFile(path, raw, 0644); err != nil {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+
+	reopened, err := NewSST(path)
+	if err != nil {
+		t.Fatalf("reopen failed: %v", err)
+	}
+	defer reopened.Close()
+
+	if err := reopened.LoadIndexBlock(); err == nil {
+		t.Errorf("expected LoadIndexBlock to detect corrupted indexOffset, got nil err")
 	}
 }
 

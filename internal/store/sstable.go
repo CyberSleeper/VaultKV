@@ -8,6 +8,7 @@ import (
 	"io"
 	"math"
 	"os"
+	"sort"
 )
 
 const maxEntryCntBytes = math.MaxUint16
@@ -24,6 +25,10 @@ type SST struct {
 	fd           *os.File
 	filename     string
 	indexEntries []*IndexBlockEntry
+	// indexOffset is the byte offset where the index region begins, i.e. the
+	// end of the last data block. Needed to compute the boundary of the final
+	// data block during a point lookup. Populated by LoadIndexBlock.
+	indexOffset uint32
 }
 
 type SSTEntry struct {
@@ -133,6 +138,19 @@ func (s *SST) Flush(skiplist *Skiplist) error {
 	return nil
 }
 
+// indexBlockChecksum computes the CRC over the sparse index region together
+// with the indexOffset footer field. Folding indexOffset in makes its
+// integrity explicit: a corrupted offset changes the checksum input and is
+// rejected on read, rather than relying only on the offset happening to shift
+// the checksummed byte range. magicNumber is omitted because it is a known
+// constant validated by direct equality.
+func indexBlockChecksum(indexData []byte, indexOffset uint32) uint32 {
+	buf := make([]byte, len(indexData)+4)
+	copy(buf, indexData)
+	binary.LittleEndian.PutUint32(buf[len(indexData):], indexOffset)
+	return crc32.ChecksumIEEE(buf)
+}
+
 func (e *SSTEntry) Encode(w io.Writer) error {
 	var indexSlice []indexEntry
 	var currentBlockBuf bytes.Buffer
@@ -195,7 +213,7 @@ func (e *SSTEntry) Encode(w io.Writer) error {
 	indexOffset := fileOffset
 
 	var indexBuf bytes.Buffer
-	
+
 	// Write the number of index entries
 	numIndexEntries := uint32(len(indexSlice))
 	if err := binary.Write(&indexBuf, binary.LittleEndian, numIndexEntries); err != nil {
@@ -214,15 +232,15 @@ func (e *SSTEntry) Encode(w io.Writer) error {
 			return err
 		}
 	}
-	
+
 	indexData := indexBuf.Bytes()
-	indexChecksum := crc32.ChecksumIEEE(indexData)
-	
+	indexChecksum := indexBlockChecksum(indexData, indexOffset)
+
 	// Write Index Data
 	if _, err := w.Write(indexData); err != nil {
 		return err
 	}
-	
+
 	// Write Index Checksum
 	if err := binary.Write(w, binary.LittleEndian, indexChecksum); err != nil {
 		return err
@@ -241,7 +259,7 @@ func (e *SSTEntry) Encode(w io.Writer) error {
 
 func flushBlock(buf *bytes.Buffer, w io.Writer, fileOffset *uint32, indexSlice *[]indexEntry, firstKey string, numEntries uint16) error {
 	blockData := buf.Bytes()
-	
+
 	// Calculate block checksum (covering numEntries + data)
 	// We prepend numEntries to the buffer logically for checksum, but write it separately
 	var checksumBuf bytes.Buffer
@@ -275,116 +293,73 @@ func flushBlock(buf *bytes.Buffer, w io.Writer, fileOffset *uint32, indexSlice *
 	return nil
 }
 
+// Decode reads an entire SST stream and reconstructs every LogEntry in order.
+// It verifies the index checksum and each per-block checksum along the way.
+// Intended for whole-file consumers such as compaction's K-way merge.
 func (e *SSTEntry) Decode(r io.Reader) error {
-	var dataLen uint16
-
-	var buf bytes.Buffer
-
-	if err := binary.Read(r, binary.LittleEndian, &dataLen); err != nil {
+	data, err := io.ReadAll(r)
+	if err != nil {
 		return err
 	}
-
-	if err := binary.Write(&buf, binary.LittleEndian, dataLen); err != nil {
-		return err
+	if len(data) < 12 {
+		return fmt.Errorf("sst too small to contain footer: %d bytes", len(data))
 	}
 
-	logEntries := make([]*LogEntry, dataLen)
+	footerStart := len(data) - 12
+	indexChecksum := binary.LittleEndian.Uint32(data[footerStart : footerStart+4])
+	indexOffset := binary.LittleEndian.Uint32(data[footerStart+4 : footerStart+8])
+	magic := binary.LittleEndian.Uint32(data[footerStart+8 : footerStart+12])
 
-	for i := range dataLen {
-		var keyLen uint16
-		var valLen uint32
-
-		if err := binary.Read(r, binary.LittleEndian, &keyLen); err != nil {
-			return err
-		}
-		if err := binary.Read(r, binary.LittleEndian, &valLen); err != nil {
-			return err
-		}
-
-		keyBytes := make([]byte, keyLen)
-		valBytes := make([]byte, valLen)
-
-		if _, err := io.ReadFull(r, keyBytes); err != nil {
-			return err
-		}
-		if _, err := io.ReadFull(r, valBytes); err != nil {
-			return err
-		}
-
-		// Wrtie to buf for the checksum later
-		if err := binary.Write(&buf, binary.LittleEndian, keyLen); err != nil {
-			return err
-		}
-		if err := binary.Write(&buf, binary.LittleEndian, valLen); err != nil {
-			return err
-		}
-		if _, err := buf.Write(keyBytes); err != nil {
-			return err
-		}
-		if _, err := buf.Write(valBytes); err != nil {
-			return err
-		}
-
-		logEntries[i] = &LogEntry{
-			Key:   string(keyBytes),
-			Value: string(valBytes),
-		}
+	if magic != magicNumber {
+		return fmt.Errorf("invalid magic number: got 0x%X, expected 0x%X", magic, magicNumber)
+	}
+	if int(indexOffset) > footerStart {
+		return fmt.Errorf("invalid index offset %d exceeds footer position %d", indexOffset, footerStart)
 	}
 
-	for range dataLen {
-		var curIndex indexEntry
+	if indexBlockChecksum(data[indexOffset:footerStart], indexOffset) != indexChecksum {
+		return fmt.Errorf("corrupted SST index block: checksum mismatch")
+	}
 
-		if err := binary.Read(r, binary.LittleEndian, &curIndex.pointer); err != nil {
-			return err
+	// Walk every data block in [0, indexOffset).
+	// Block layout: [numEntries(2)][entries...][checksum(4)]
+	var logEntries []*LogEntry
+	cursor := 0
+	for cursor < int(indexOffset) {
+		blockStart := cursor
+		if cursor+2 > int(indexOffset) {
+			return fmt.Errorf("malformed block header at offset %d", cursor)
 		}
-		if err := binary.Read(r, binary.LittleEndian, &curIndex.keyLen); err != nil {
-			return err
+		numEntries := binary.LittleEndian.Uint16(data[cursor : cursor+2])
+		cursor += 2
+
+		for range numEntries {
+			if cursor+6 > len(data) {
+				return fmt.Errorf("malformed entry header at offset %d", cursor)
+			}
+			keyLen := int(binary.LittleEndian.Uint16(data[cursor : cursor+2]))
+			valLen := int(binary.LittleEndian.Uint32(data[cursor+2 : cursor+6]))
+			cursor += 6
+
+			if cursor+keyLen+valLen > len(data) {
+				return fmt.Errorf("malformed entry body at offset %d", cursor)
+			}
+			key := string(data[cursor : cursor+keyLen])
+			cursor += keyLen
+			val := string(data[cursor : cursor+valLen])
+			cursor += valLen
+
+			logEntries = append(logEntries, &LogEntry{Key: key, Value: val})
 		}
 
-		keyBytes := make([]byte, curIndex.keyLen)
-		if _, err := io.ReadFull(r, keyBytes); err != nil {
-			return err
+		if cursor+4 > len(data) {
+			return fmt.Errorf("missing block checksum at offset %d", cursor)
 		}
-
-		if err := binary.Write(&buf, binary.LittleEndian, curIndex.pointer); err != nil {
-			return err
+		storedChecksum := binary.LittleEndian.Uint32(data[cursor : cursor+4])
+		if crc32.ChecksumIEEE(data[blockStart:cursor]) != storedChecksum {
+			return fmt.Errorf("corrupted SST data block at offset %d: checksum mismatch", blockStart)
 		}
-		if err := binary.Write(&buf, binary.LittleEndian, curIndex.keyLen); err != nil {
-			return err
-		}
-		if _, err := buf.Write(keyBytes); err != nil {
-			return err
-		}
-	}
-
-	var curIndexOffset uint32
-	var curMagicNumber uint32
-
-	if err := binary.Read(r, binary.LittleEndian, &curIndexOffset); err != nil {
-		return err
-	}
-	if err := binary.Read(r, binary.LittleEndian, &curMagicNumber); err != nil {
-		return err
-	}
-
-	if curMagicNumber != magicNumber {
-		return fmt.Errorf("invalid magic number: got 0x%X, expected 0x%X", curMagicNumber, magicNumber)
-	}
-
-	if err := binary.Write(&buf, binary.LittleEndian, curIndexOffset); err != nil {
-		return err
-	}
-	if err := binary.Write(&buf, binary.LittleEndian, curMagicNumber); err != nil {
-		return err
-	}
-
-	var checksum uint32
-	if err := binary.Read(r, binary.LittleEndian, &checksum); err != nil {
-		return err
-	}
-
-	if crc32.ChecksumIEEE(buf.Bytes()) != checksum {
-		return fmt.Errorf("corrupted SST entry: expected checksum %d", checksum)
+		cursor += 4
 	}
 
 	e.LogEntries = logEntries
@@ -393,69 +368,70 @@ func (e *SSTEntry) Decode(r io.Reader) error {
 }
 
 func (e *SST) LoadIndexBlock() error {
-	// 1. Jump straight to the Footer (last 12 bytes of the file)
-	// (IndexOffset: 4 bytes, MagicNumber: 4 bytes, Checksum: 4 bytes)
-
+	// The file ends with a 12-byte footer:
+	//   [indexChecksum(4)][indexOffset(4)][magicNumber(4)]
+	// The index region itself spans [indexOffset, footerStart) and is laid out:
+	//   [numIndexEntries(4)] [ (ptr(4) keyLen(2) key) ... ]
 	fd := e.fd
 
-	footerStart, err := fd.Seek(-12, io.SeekEnd)
+	info, err := fd.Stat()
 	if err != nil {
 		return err
 	}
+	fileSize := info.Size()
+	if fileSize < 12 {
+		return fmt.Errorf("sst too small to contain footer: %d bytes", fileSize)
+	}
+	footerStart := fileSize - 12
 
-	var indexOffset uint32
-	var magic uint32
-	var checksum uint32
-
-	if err := binary.Read(fd, binary.LittleEndian, &indexOffset); err != nil {
+	footer := make([]byte, 12)
+	if _, err := fd.ReadAt(footer, footerStart); err != nil {
 		return err
 	}
-	if err := binary.Read(fd, binary.LittleEndian, &magic); err != nil {
-		return err
-	}
 
-	// Currently we don't check the data integrity as it would take a lot of time to validate a whole SST file chunks
-	// Instead of having a single checksum per file, it is better to have a checksum per small chunk (ex. 4KB)
-	// But yes, let's put this as TODO for now since it is quite high effort and deserves its own issue
-	if err := binary.Read(fd, binary.LittleEndian, &checksum); err != nil {
-		return err
-	}
+	indexChecksum := binary.LittleEndian.Uint32(footer[0:4])
+	indexOffset := binary.LittleEndian.Uint32(footer[4:8])
+	magic := binary.LittleEndian.Uint32(footer[8:12])
 
 	if magic != magicNumber {
 		return fmt.Errorf("invalid magic number: got 0x%X, expected 0x%X", magic, magicNumber)
 	}
 
-	// 2. Jump to the exact byte where the Index Block starts
-	if _, err := fd.Seek(int64(indexOffset), io.SeekStart); err != nil {
-		return err
-	}
-
-	// 3. Read everything between IndexOffset and FooterStart
 	indexSize := footerStart - int64(indexOffset)
 	if indexSize < 0 {
 		return fmt.Errorf("invalid index offset %d exceeds footer position %d", indexOffset, footerStart)
 	}
-	limitReader := io.LimitReader(fd, indexSize)
 
-	var indices []*IndexBlockEntry
+	indexData := make([]byte, indexSize)
+	if _, err := fd.ReadAt(indexData, int64(indexOffset)); err != nil {
+		return err
+	}
 
-	for {
+	if indexBlockChecksum(indexData, indexOffset) != indexChecksum {
+		return fmt.Errorf("corrupted SST index block in %s: checksum mismatch", e.filename)
+	}
+
+	reader := bytes.NewReader(indexData)
+
+	var numIndexEntries uint32
+	if err := binary.Read(reader, binary.LittleEndian, &numIndexEntries); err != nil {
+		return err
+	}
+
+	indices := make([]*IndexBlockEntry, 0, numIndexEntries)
+	for i := uint32(0); i < numIndexEntries; i++ {
 		var entry IndexBlockEntry
-		err := binary.Read(limitReader, binary.LittleEndian, &entry.Ptr)
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
+		if err := binary.Read(reader, binary.LittleEndian, &entry.Ptr); err != nil {
 			return err
 		}
 
 		var keyLen uint16
-		if err := binary.Read(limitReader, binary.LittleEndian, &keyLen); err != nil {
+		if err := binary.Read(reader, binary.LittleEndian, &keyLen); err != nil {
 			return err
 		}
 
 		entry.KeyBytes = make([]byte, keyLen)
-		if _, err := io.ReadFull(limitReader, entry.KeyBytes); err != nil {
+		if _, err := io.ReadFull(reader, entry.KeyBytes); err != nil {
 			return err
 		}
 
@@ -463,6 +439,88 @@ func (e *SST) LoadIndexBlock() error {
 	}
 
 	e.indexEntries = indices
+	e.indexOffset = indexOffset
 
 	return nil
+}
+
+// lookup finds targetKey within this SST using the sparse block index.
+//
+// The index stores the FIRST key of each ~4KB data block, so we binser
+// for the block whose key range could contain targetKey, read that single
+// block, verify its CRC, and scan it. Returns (value, true, nil) on a hit,
+// ("", false, nil) if the key is not present, or a non-nil error if the block
+// could not be read or failed its checksum.
+func (s *SST) lookup(targetKey string) (string, bool, error) {
+	if len(s.indexEntries) == 0 {
+		return "", false, nil
+	}
+
+	target := []byte(targetKey)
+
+	// First index entry whose first key is strictly greater than target, the
+	// candidate block is the one immediately before it.
+	hi := sort.Search(len(s.indexEntries), func(i int) bool {
+		return bytes.Compare(s.indexEntries[i].KeyBytes, target) > 0
+	})
+	if hi == 0 {
+		// target sorts before the first key of the first block
+		return "", false, nil
+	}
+	blockIdx := hi - 1
+
+	blockStart := s.indexEntries[blockIdx].Ptr
+	var blockEnd uint32
+	if blockIdx+1 < len(s.indexEntries) {
+		blockEnd = s.indexEntries[blockIdx+1].Ptr
+	} else {
+		blockEnd = s.indexOffset
+	}
+	if blockEnd <= blockStart {
+		return "", false, fmt.Errorf("invalid block boundaries: start=%d end=%d", blockStart, blockEnd)
+	}
+
+	// Block layout on disk: [numEntries(2)][entries...][checksum(4)]
+	block := make([]byte, blockEnd-blockStart)
+	if _, err := s.fd.ReadAt(block, int64(blockStart)); err != nil {
+		return "", false, err
+	}
+	if len(block) < 6 {
+		return "", false, fmt.Errorf("sst block at offset %d too small: %d bytes", blockStart, len(block))
+	}
+
+	payload := block[:len(block)-4] // numEntries + entries (checksum input)
+	storedChecksum := binary.LittleEndian.Uint32(block[len(block)-4:])
+	if crc32.ChecksumIEEE(payload) != storedChecksum {
+		return "", false, fmt.Errorf("corrupted SST data block at offset %d: checksum mismatch", blockStart)
+	}
+
+	numEntries := binary.LittleEndian.Uint16(payload[0:2])
+	cursor := 2
+	for range numEntries {
+		if cursor+6 > len(payload) {
+			return "", false, fmt.Errorf("malformed entry header in block at offset %d", blockStart)
+		}
+		keyLen := int(binary.LittleEndian.Uint16(payload[cursor : cursor+2]))
+		valLen := int(binary.LittleEndian.Uint32(payload[cursor+2 : cursor+6]))
+		cursor += 6
+
+		if cursor+keyLen+valLen > len(payload) {
+			return "", false, fmt.Errorf("malformed entry body in block at offset %d", blockStart)
+		}
+		key := payload[cursor : cursor+keyLen]
+		cursor += keyLen
+		val := payload[cursor : cursor+valLen]
+		cursor += valLen
+
+		switch bytes.Compare(key, target) {
+		case 0:
+			return string(val), true, nil
+		case 1:
+			// entries are sorted; we've passed where target would be
+			return "", false, nil
+		}
+	}
+
+	return "", false, nil
 }

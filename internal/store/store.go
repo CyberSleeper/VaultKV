@@ -1,14 +1,11 @@
 package store
 
 import (
-	"bytes"
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
-	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -282,49 +279,24 @@ func (s *Store) getInternal(targetKey string) (string, bool) {
 		}
 	}
 
-	// 3. SSTables (newest to oldest)
+	// 3. SSTables (newest to oldest). The sparse index + block read/scan and
+	// CRC verification all live in SST.lookup; ReadAt keeps reads atomic and
+	// cursor-free so they are safe under the RLock held here.
 	var foundVal string
 	var isFound bool
 
 	s.ForEachSST(func(lvl int, curSst *SST) bool {
-		targetBytes := []byte(targetKey)
-		idx, found := slices.BinarySearchFunc(curSst.indexEntries, targetBytes, func(entry *IndexBlockEntry, target []byte) int {
-			return bytes.Compare(entry.KeyBytes, target)
-		})
-
+		val, found, err := curSst.lookup(targetKey)
+		if err != nil {
+			// Treat a read/checksum failure as "not in this SST" and keep
+			// scanning older SSTs rather than crashing the read path.
+			return true
+		}
 		if found {
-			exactPtr := curSst.indexEntries[idx].Ptr
-			keyLen := len(targetKey)
-
-			// Note: Do not use fd.Seek as it will change the global fd, which will ofc
-			// mess with the concurrency as we are using Rlock here. Use ReadAt instead
-			// The implementation at 05 May 2026 is already tested and checked thoroughtly
-			// So supposedly it is already correct UwU (hopefully)
-
-			// Trivia: ReadAt maps to pread in Unix system, so it is atomic read
-
-			// exactPtr points to the beginning of the record (the 2-byte keyLen).
-			// The 4-byte valLen is located right after keyLen (exactPtr + 2).
-			valLenBytes := make([]byte, 4)
-			if _, err := curSst.fd.ReadAt(valLenBytes, int64(exactPtr+2)); err != nil {
-				return true
-			}
-			valLen := binary.LittleEndian.Uint32(valLenBytes)
-
-			// The actual Value bytes are located after keyLen, valLen, and the Key string.
-			// Offset = exactPtr + 2 (keyLen) + 4 (valLen) + keyLen (the actual key bytes)
-			valOffset := int64(exactPtr) + 2 + 4 + int64(keyLen)
-
-			valBytes := make([]byte, valLen)
-			if _, err := curSst.fd.ReadAt(valBytes, valOffset); err != nil {
-				return true
-			}
-
-			foundVal = string(valBytes)
+			foundVal = val
 			isFound = true
 			return false
 		}
-
 		return true
 	})
 
