@@ -13,16 +13,16 @@ type CompactionWorker struct {
 	wgCompaction sync.WaitGroup
 	ticker       *time.Ticker
 	ctx          context.Context
-	compactChan  <-chan int
+	compactChan  chan struct{}
 	storeManager StoreManager
 }
 
 type StoreManager interface {
-	CheckCompaction(level int)
+	CheckCompaction()
 	ExecuteCompaction(level int)
 }
 
-func NewCompactionWorker(interval time.Duration, compactChan <-chan int, storeManager StoreManager) *CompactionWorker {
+func NewCompactionWorker(interval time.Duration, compactChan chan struct{}, storeManager StoreManager) *CompactionWorker {
 	ticker := time.NewTicker(interval)
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -47,12 +47,15 @@ func (c *CompactionWorker) Run() {
 			case <-c.ctx.Done():
 				fmt.Println("Compaction worker stopped")
 				return
-			case level := <-c.compactChan:
-				c.storeManager.CheckCompaction(level)
+			// Both the doorbell (rung after a flush) and the periodic tick (a
+			// safety-net backstop) funnel into the same scan-all-levels pass,
+			// so there is exactly one compaction path.
+			case <-c.compactChan:
+				c.Compact()
 			case <-c.ticker.C:
 				c.Compact()
 			}
-		} 
+		}
 	}()
 }
 
@@ -64,18 +67,13 @@ func (c *CompactionWorker) Stop() {
 	c.wgCompaction.Wait()
 }
 
+// Compact runs one scan-all-levels compaction pass. The WaitGroup lets Stop()
+// block until an in-flight pass finishes rather than tearing it down mid-merge.
+// The actual size-tiered merge lives in the store's CheckCompaction ->
+// ExecuteCompaction path.
 func (c *CompactionWorker) Compact() {
 	c.wgCompaction.Add(1)
 	defer c.wgCompaction.Done()
 
-	// TODO: implement size-tiered compaction
-	// Current idea
-	// 1. Pass the filenames for those SST we want to compact
-	// 2. Do the K-way merge, it's just like a normal merging but we need to put
-	// all elements from topmost to a heap, this way the complexity is O(N log K)
-	// instead of O(NK) where N is the len of longest SST entries.
-	// 3. Create the compacted SST
-	// 4. Lock the SST and remove the references and files of old SSTs then insert
-	// the resulting SST
-	// 5. Unlock
+	c.storeManager.CheckCompaction()
 }

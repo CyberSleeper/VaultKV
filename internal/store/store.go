@@ -54,7 +54,11 @@ type Store struct {
 	isClosed         bool
 	OnFlushErr       func(error) // Callback for background flush errors
 	compactionWorker *worker.CompactionWorker
-	compactChan      chan int
+	// compactChan is a coalescing "doorbell": it carries no level information.
+	// A single buffered slot means many flushes collapse into one pending
+	// wake-up, and the worker re-scans every level on each wake, so dropping a
+	// duplicate signal can never lose a level-specific trigger.
+	compactChan chan struct{}
 }
 
 func NewStore(dir, nodeID string) (*Store, error) {
@@ -162,7 +166,7 @@ func NewStore(dir, nodeID string) (*Store, error) {
 		return nil, fmt.Errorf("initializing WAL: %w", err)
 	}
 
-	compactChan := make(chan int, 100)
+	compactChan := make(chan struct{}, 1)
 
 	storeObj := &Store{
 		dir:         dir,
@@ -432,44 +436,72 @@ func (s *Store) flushWorker() {
 		s.frozenMemTs[0] = nil // Avoid memory leak, tell GC to sweep it
 		s.frozenMemTs = s.frozenMemTs[1:]
 
-		curLvl := 0
-		
+		// Flush will only flush to lvl 0
+		const curLvl = 0
+
 		for len(s.SSTLevels) <= curLvl {
 			s.SSTLevels = append(s.SSTLevels, &SSTLevel{
 				LevelNum: len(s.SSTLevels),
 				Tables:   make([]*SST, 0),
 			})
 		}
-		
+
 		s.SSTLevels[curLvl].Tables = append(s.SSTLevels[curLvl].Tables, newSst)
-		s.compactChan <- curLvl
 		s.mu.Unlock()
+
+		// Ring the compaction doorbell strictly OUTSIDE the lock to avoid a
+		// channel-mutex deadlock: the worker drains this by calling
+		// CheckCompaction, which needs the RLock.
+		s.signalCompaction()
 	}
 }
 
-func (s *Store) CheckCompaction(level int) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	if level >= len(s.SSTLevels) {
-		return
+// signalCompaction rings the compaction doorbell without blocking. The bell
+// carries no level info, so if a wake-up is already pending we simply drop the
+// duplicate — the worker re-scans all levels on its next pass regardless.
+func (s *Store) signalCompaction() {
+	select {
+	case s.compactChan <- struct{}{}:
+	default:
 	}
+}
 
+// CheckCompaction scans every level and compacts those that have reched their
+// size-tiered threshold. It is invoked by the compaction worker on each
+// doorbell ring and on each periodic tick. The threshold grows geometrically:
+// L0 = maxLevel0Files, and each deeper level multiplies by
+// maxLevelFilesMultiplier.
+func (s *Store) CheckCompaction() {
+	s.mu.RLock()
+	var overThreshold []int
 	threshold := maxLevel0Files
-	for range level {
+	for level := range s.SSTLevels {
+		if s.SSTLevels[level] != nil && len(s.SSTLevels[level].Tables) >= threshold {
+			overThreshold = append(overThreshold, level)
+		}
 		threshold *= maxLevelFilesMultiplier
 	}
+	s.mu.RUnlock()
 
-	if len(s.SSTLevels[level].Tables) >= threshold {
-		go s.ExecuteCompaction(level)
+	// Run compactions outside the read lock; ExecuteCompaction takes its own
+	// write lock when it swaps SSTs in. A level pushed over threshold by this
+	// pass (e.g. L1 growing after an L0 merge) is caught on the next doorbell.
+	for _, level := range overThreshold {
+		s.ExecuteCompaction(level)
 	}
 }
 
 func (s *Store) ExecuteCompaction(level int) {
-	// TODO: Trigger actual compaction worker logic here.
-	// For now, we will just print a log or delegate it to compactionWorker.
-	// The CompactionWorker currently has a Compact() method. We should probably
-	// notify the CompactionWorker to start compacting a specific level instead.
+	// TODO: implement size-tiered compaction for the given level.
+	// 1. Snapshot the SSTs in this level to compact.
+	// 2. K-way merge via a min-heap over their entries: O(N log K) rather than
+	//    O(N*K), where N is the total entry count and K the number of SSTs.
+	// 3. Write the merged result as a new SST at level+1.
+	// 4. Under s.mu.Lock(): remove the old SSTs (refs + files) from this level
+	//    and append the new SST to level+1, then unlock.
+	// NOTE before this goes live: guard against concurrent compaction of the
+	// same level (an in-progress flag), and track in-flight compactions so
+	// Close() can wait for them.
 	fmt.Printf("Triggering compaction for level %d\n", level)
 }
 
