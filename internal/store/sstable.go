@@ -71,6 +71,23 @@ func (s *SST) Close() error {
 	return firstErr
 }
 
+// Delete closes the underlying file descriptor and removes the .sst file from
+// disk. It is used by compaction to discard the input SSTs once their data has
+// been merged into a new SST. Safe to call more than once: a nil fd is a no-op.
+func (s *SST) Delete() error {
+	if s.fd == nil {
+		return nil
+	}
+
+	name := s.filename
+	if err := s.fd.Close(); err != nil {
+		return err
+	}
+	s.fd = nil
+
+	return os.Remove(name)
+}
+
 type indexEntry struct {
 	pointer uint32
 	keyLen  uint16
@@ -111,6 +128,15 @@ func (s *SST) MergeSkiplist(skiplist *Skiplist) *SSTEntry {
 	return sstableEntry
 }
 
+// Append serializes the entire entry — all data blocks, the sparse index, and
+// the footer — to the file in one shot, then fsyncs.
+//
+// It is NOT incremental: each call writes a complete, self-contained SST. Call
+// it exactly ONCE per SST. Because Encode lays out block/index offsets relative
+// to the start of its own output (offset 0), a second Append would write a
+// second footer past the first whose offsets are wrong, and LoadIndexBlock —
+// which reads only the trailing footer — would parse garbage. One memtable (or
+// one merge result) maps to one Append maps to one SST file.
 func (s *SST) Append(entry *SSTEntry) error {
 	if entry == nil {
 		return fmt.Errorf("nil sst entry")

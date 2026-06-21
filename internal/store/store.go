@@ -486,23 +486,190 @@ func (s *Store) CheckCompaction() {
 	// Run compactions outside the read lock; ExecuteCompaction takes its own
 	// write lock when it swaps SSTs in. A level pushed over threshold by this
 	// pass (e.g. L1 growing after an L0 merge) is caught on the next doorbell.
+	//
+	// Call synchronously, NOT `go s.ExecuteCompaction(...)`: serial invocation
+	// is what keeps compactions from racing each other and keeps them inside
+	// the worker's WaitGroup for graceful shutdown (see ExecuteCompaction doc).
 	for _, level := range overThreshold {
 		s.ExecuteCompaction(level)
 	}
 }
 
+// ExecuteCompaction merges every SST currently in `level` into a single new
+// SST at level+1 (a simplified size-tiered scheme).
+//
+// MUST be called synchronously (never `go s.ExecuteCompaction(...)`). It relies
+// on two invariants that only hold under serial invocation by the single
+// compaction worker goroutine:
+//   - No two compactions run at once, so no in-progress guard is needed and the
+//     locked swap in step 5 cannot race another compaction.
+//   - It runs inside CompactionWorker.Compact, whose WaitGroup lets Close()
+//     block until an in-flight compaction finishes. Spawning it on a new
+//     goroutine would escape that WaitGroup and break graceful shutdown.
+//
+// Crash safety: the merged SST is written to a ".tmp" file and renamed into
+// place only once fully written and synced. The NewStore glob (`*.sst`) ignores
+// ".tmp", so a crash mid-write leaves a partial temp that is simply ignored on
+// restart rather than bricking startup.
 func (s *Store) ExecuteCompaction(level int) {
-	// TODO: implement size-tiered compaction for the given level.
-	// 1. Snapshot the SSTs in this level to compact.
-	// 2. K-way merge via a min-heap over their entries: O(N log K) rather than
-	//    O(N*K), where N is the total entry count and K the number of SSTs.
-	// 3. Write the merged result as a new SST at level+1.
-	// 4. Under s.mu.Lock(): remove the old SSTs (refs + files) from this level
-	//    and append the new SST to level+1, then unlock.
-	// NOTE before this goes live: guard against concurrent compaction of the
-	// same level (an in-progress flag), and track in-flight compactions so
-	// Close() can wait for them.
-	fmt.Printf("Triggering compaction for level %d\n", level)
+	handleErr := func(err error) {
+		if s.OnFlushErr != nil {
+			s.OnFlushErr(err)
+		} else {
+			fmt.Printf("Background compaction error: %v\n", err)
+		}
+	}
+
+	// 1. Snapshot the inputs. We copy the slice so the merge runs without
+	//    holding the lock; concurrent flushes may append new SSTs to L0 in the
+	//    meantime, which we deliberately exclude from this compaction.
+	s.mu.RLock()
+	if level >= len(s.SSTLevels) || s.SSTLevels[level] == nil || len(s.SSTLevels[level].Tables) == 0 {
+		s.mu.RUnlock()
+		return
+	}
+	inputs := make([]*SST, len(s.SSTLevels[level].Tables))
+	copy(inputs, s.SSTLevels[level].Tables)
+	s.mu.RUnlock()
+
+	// 2. Merge with newest-wins semantics.
+	merged, err := mergeSSTs(inputs)
+	if err != nil {
+		handleErr(fmt.Errorf("compaction merge (L%d): %w", level, err))
+		return
+	}
+
+	// 3. Write the result to a temp file, then atomically rename it in.
+	targetLevel := level + 1
+	finalName := fmt.Sprintf("vault_%s_L%d_%d.sst", s.nodeId, targetLevel, time.Now().UnixNano())
+	finalPath := filepath.Join(s.dir, finalName)
+	tmpPath := finalPath + ".tmp"
+
+	if err := writeSSTFile(tmpPath, merged); err != nil {
+		_ = os.Remove(tmpPath)
+		handleErr(fmt.Errorf("compaction write (L%d): %w", level, err))
+		return
+	}
+	if err := os.Rename(tmpPath, finalPath); err != nil {
+		_ = os.Remove(tmpPath)
+		handleErr(fmt.Errorf("compaction rename (L%d): %w", level, err))
+		return
+	}
+
+	// 4. Open the live handle for the merged SST and load its index.
+	newSst, err := NewSST(finalPath)
+	if err != nil {
+		handleErr(fmt.Errorf("compaction open new SST (L%d): %w", level, err))
+		return
+	}
+	if err := newSst.LoadIndexBlock(); err != nil {
+		newSst.Close()
+		_ = os.Remove(finalPath)
+		handleErr(fmt.Errorf("compaction index new SST (L%d): %w", level, err))
+		return
+	}
+
+	// 5. Atomically swap: drop exactly the compacted inputs from `level` and
+	//    append the merged SST to level+1. We filter by pointer identity so any
+	//    SST a concurrent flush appended since the snapshot is preserved.
+	s.mu.Lock()
+	for len(s.SSTLevels) <= targetLevel {
+		s.SSTLevels = append(s.SSTLevels, &SSTLevel{
+			LevelNum: len(s.SSTLevels),
+			Tables:   make([]*SST, 0),
+		})
+	}
+
+	inputSet := make(map[*SST]struct{}, len(inputs))
+	for _, in := range inputs {
+		inputSet[in] = struct{}{}
+	}
+	remaining := make([]*SST, 0, len(s.SSTLevels[level].Tables))
+	for _, t := range s.SSTLevels[level].Tables {
+		if _, compacted := inputSet[t]; !compacted {
+			remaining = append(remaining, t)
+		}
+	}
+	s.SSTLevels[level].Tables = remaining
+	s.SSTLevels[targetLevel].Tables = append(s.SSTLevels[targetLevel].Tables, newSst)
+	s.mu.Unlock()
+
+	// 6. Delete the old files. Safe after the unlock: the inputs are no longer
+	//    referenced, and any reader either finished before the swap or started
+	//    after it (Get holds RLock for its whole duration, mutually exclusive
+	//    with the swap's Lock).
+	for _, old := range inputs {
+		if err := old.Delete(); err != nil {
+			handleErr(fmt.Errorf("removing compacted SST %s: %w", old.filename, err))
+		}
+	}
+}
+
+// mergeSSTs reads every input SST and returns their entries merged into a
+// single sorted SSTEntry. On a duplicate key the newest value wins.
+//
+// `inputs` is assumed ordered oldest -> newest (the Store keeps each level's
+// Tables sorted by filename, which embeds the creation timestamp). Iterating in
+// that order into a map lets a newer value overwrite an older one.
+//
+// Tombstones are carried through verbatim — never dropped. That is always
+// correct (a tombstone keeps shadowing older data in deeper levels) but not
+// space-optimal.
+// FUTURE IMPROVEMENT: when compacting into the bottom-most level, tombstones
+// (and the keys they shadow) can be discarded entirely to reclaim space.
+// FUTURE IMPROVEMENT: replace the map + re-sort with a k-way heap merge over
+// the already-sorted inputs (O(N log K)) as part of moving to full STCS.
+func mergeSSTs(inputs []*SST) (*SSTEntry, error) {
+	latest := make(map[string]string)
+
+	for _, in := range inputs {
+		// Read through a fresh private handle so we never disturb the offset of
+		// the live fd that concurrent point lookups read via ReadAt.
+		f, err := os.Open(in.filename)
+		if err != nil {
+			return nil, err
+		}
+
+		entry := NewSSTableEntry()
+		decodeErr := entry.Decode(f)
+		f.Close()
+		if decodeErr != nil {
+			return nil, decodeErr
+		}
+
+		for _, le := range entry.LogEntries {
+			latest[le.Key] = le.Value
+		}
+	}
+
+	keys := make([]string, 0, len(latest))
+	for k := range latest {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	merged := NewSSTableEntry()
+	for _, k := range keys {
+		merged.LogEntries = append(merged.LogEntries, NewLogEntry(k, latest[k]))
+	}
+	return merged, nil
+}
+
+// writeSSTFile creates a new SST at path, writes the entry (Encode + fsync via
+// Append), and closes the handle. The handle is closed before the caller
+// renames the file so the rename is safe on Windows.
+func writeSSTFile(path string, entry *SSTEntry) error {
+	sst, err := NewSST(path)
+	if err != nil {
+		return err
+	}
+
+	if err := sst.Append(entry); err != nil {
+		sst.Close()
+		return err
+	}
+
+	return sst.Close()
 }
 
 func (s *Store) Close() error {
