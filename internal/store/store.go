@@ -1,6 +1,7 @@
 package store
 
 import (
+	"container/heap"
 	"errors"
 	"fmt"
 	"os"
@@ -605,53 +606,102 @@ func (s *Store) ExecuteCompaction(level int) {
 	}
 }
 
-// mergeSSTs reads every input SST and returns their entries merged into a
-// single sorted SSTEntry. On a duplicate key the newest value wins.
+// mergeItem is one element in the k-way merge heap: the current key/value
+// being considered from a single input SST, plus the iterator to advance it.
+type mergeItem struct {
+	key    string
+	val    string
+	sstIdx int      // position in the inputs slice; higher index = newer SST
+	iter   *sstIter // live cursor into this SST's data blocks
+}
+
+// mergeHeap implements container/heap over mergeItems.
 //
-// `inputs` is assumed ordered oldest -> newest (the Store keeps each level's
-// Tables sorted by filename, which embeds the creation timestamp). Iterating in
-// that order into a map lets a newer value overwrite an older one.
+// Ordering: key ASC, then sstIdx DESC for ties. The DESC tie-break ensures
+// that, when the same key exists in multiple SSTs, the newest SST's copy
+// surfaces first so the loop in mergeSSTs can emit it and discard the rest
+// without ever seeing them in the output.
+type mergeHeap []mergeItem
+
+func (h mergeHeap) Len() int      { return len(h) }
+func (h mergeHeap) Swap(i, j int) { h[i], h[j] = h[j], h[i] }
+func (h mergeHeap) Less(i, j int) bool {
+	if h[i].key != h[j].key {
+		return h[i].key < h[j].key
+	}
+	return h[i].sstIdx > h[j].sstIdx // newer SST wins the tie
+}
+func (h *mergeHeap) Push(x any) { *h = append(*h, x.(mergeItem)) }
+func (h *mergeHeap) Pop() any {
+	old := *h
+	n := len(old)
+	x := old[n-1]
+	*h = old[:n-1]
+	return x
+}
+
+// mergeSSTs performs a k-way heap merge over the input SSTables and returns
+// their entries as a single sorted SSTEntry. Inputs must be ordered
+// oldest→newest; the Store maintains this invariant by sorting each level's
+// Tables by filename, which embeds the creation timestamp.
 //
+// On a duplicate key the newest value wins (O(N log K) merge, no re-sort).
 // Tombstones are carried through verbatim — never dropped. That is always
 // correct (a tombstone keeps shadowing older data in deeper levels) but not
 // space-optimal.
 // FUTURE IMPROVEMENT: when compacting into the bottom-most level, tombstones
 // (and the keys they shadow) can be discarded entirely to reclaim space.
-// FUTURE IMPROVEMENT: replace the map + re-sort with a k-way heap merge over
-// the already-sorted inputs (O(N log K)) as part of moving to full STCS.
 func mergeSSTs(inputs []*SST) (*SSTEntry, error) {
-	latest := make(map[string]string)
+	if len(inputs) == 0 {
+		return NewSSTableEntry(), nil
+	}
 
-	for _, in := range inputs {
-		// Read through a fresh private handle so we never disturb the offset of
-		// the live fd that concurrent point lookups read via ReadAt.
-		f, err := os.Open(in.filename)
+	h := make(mergeHeap, 0, len(inputs))
+	heap.Init(&h)
+
+	// Open a streaming iterator for each input SST and seed the heap with each
+	// SST's first entry. sstIter reads the file once via os.ReadFile so it
+	// never disturbs the live fd used by concurrent point lookups.
+	for i, in := range inputs {
+		it, err := newSSTIter(in.filename)
 		if err != nil {
 			return nil, err
 		}
-
-		entry := NewSSTableEntry()
-		decodeErr := entry.Decode(f)
-		f.Close()
-		if decodeErr != nil {
-			return nil, decodeErr
+		k, v, ok, err := it.Next()
+		if err != nil {
+			return nil, err
 		}
-
-		for _, le := range entry.LogEntries {
-			latest[le.Key] = le.Value
+		if ok {
+			heap.Push(&h, mergeItem{key: k, val: v, sstIdx: i, iter: it})
 		}
 	}
-
-	keys := make([]string, 0, len(latest))
-	for k := range latest {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
 
 	merged := NewSSTableEntry()
-	for _, k := range keys {
-		merged.LogEntries = append(merged.LogEntries, NewLogEntry(k, latest[k]))
+	lastEmitted := ""
+	hasEmitted := false
+
+	for h.Len() > 0 {
+		item := heap.Pop(&h).(mergeItem)
+
+		// The heap's sstIdx DESC tie-break guarantees that for a duplicated key,
+		// the newest SST's copy is popped first. Subsequent pops of the same key
+		// come from older SSTs and must be discarded.
+		if !hasEmitted || item.key != lastEmitted {
+			merged.LogEntries = append(merged.LogEntries, NewLogEntry(item.key, item.val))
+			lastEmitted = item.key
+			hasEmitted = true
+		}
+
+		// Advance this SST's iterator and re-insert its next entry.
+		k, v, ok, err := item.iter.Next()
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			heap.Push(&h, mergeItem{key: k, val: v, sstIdx: item.sstIdx, iter: item.iter})
+		}
 	}
+
 	return merged, nil
 }
 

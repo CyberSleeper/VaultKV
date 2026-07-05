@@ -470,6 +470,106 @@ func (e *SST) LoadIndexBlock() error {
 	return nil
 }
 
+// sstIter is a forward-only, block-at-a-time cursor over the data region of
+// one SST file. It reads the file into memory once, then CRC-verifies each
+// ~4KB block in full before yielding any of its entries — so callers never
+// observe data from a corrupted block. Intended for compaction's k-way merge;
+// for point lookups use SST.lookup instead.
+type sstIter struct {
+	data    []byte // entire SST content, read once by newSSTIter
+	dataEnd int    // byte offset where data blocks end (= indexOffset)
+	cursor  int    // current read position in data
+
+	// Pre-loaded, CRC-verified entries from the current block.
+	block    []*LogEntry
+	blockPos int
+}
+
+// newSSTIter opens filename, reads it into memory, validates the footer, and
+// returns a cursor positioned at the first entry. The file is not kept open
+// after the read.
+func newSSTIter(filename string) (*sstIter, error) {
+	data, err := os.ReadFile(filename)
+	if err != nil {
+		return nil, err
+	}
+	if len(data) < 12 {
+		return nil, fmt.Errorf("sst too small to iterate: %d bytes", len(data))
+	}
+	footerStart := len(data) - 12
+	magic := binary.LittleEndian.Uint32(data[footerStart+8:])
+	if magic != magicNumber {
+		return nil, fmt.Errorf("sst invalid magic 0x%X", magic)
+	}
+	dataEnd := int(binary.LittleEndian.Uint32(data[footerStart+4:]))
+	if dataEnd > footerStart {
+		return nil, fmt.Errorf("sst invalid indexOffset %d > footerStart %d", dataEnd, footerStart)
+	}
+	return &sstIter{data: data, dataEnd: dataEnd}, nil
+}
+
+// Next returns the next LogEntry in key order. Returns ok=false when the
+// iterator is exhausted. Any non-nil error means the SST is corrupt and
+// no further data should be trusted.
+func (it *sstIter) Next() (key, val string, ok bool, err error) {
+	for {
+		if it.blockPos < len(it.block) {
+			e := it.block[it.blockPos]
+			it.blockPos++
+			return e.Key, e.Value, true, nil
+		}
+		if it.cursor >= it.dataEnd {
+			return "", "", false, nil
+		}
+		if err := it.advanceBlock(); err != nil {
+			return "", "", false, err
+		}
+	}
+}
+
+// advanceBlock reads the next data block from the SST, verifies its CRC, and
+// loads its entries into it.block. Must only be called when cursor < dataEnd.
+func (it *sstIter) advanceBlock() error {
+	blockStart := it.cursor
+	if it.cursor+2 > it.dataEnd {
+		return fmt.Errorf("truncated block header at offset %d", it.cursor)
+	}
+	numEntries := binary.LittleEndian.Uint16(it.data[it.cursor : it.cursor+2])
+	it.cursor += 2
+
+	entries := make([]*LogEntry, 0, numEntries)
+	for range numEntries {
+		if it.cursor+6 > len(it.data) {
+			return fmt.Errorf("truncated entry header at offset %d", it.cursor)
+		}
+		keyLen := int(binary.LittleEndian.Uint16(it.data[it.cursor : it.cursor+2]))
+		valLen := int(binary.LittleEndian.Uint32(it.data[it.cursor+2 : it.cursor+6]))
+		it.cursor += 6
+		if it.cursor+keyLen+valLen > len(it.data) {
+			return fmt.Errorf("truncated entry body at offset %d", it.cursor)
+		}
+		key := string(it.data[it.cursor : it.cursor+keyLen])
+		it.cursor += keyLen
+		val := string(it.data[it.cursor : it.cursor+valLen])
+		it.cursor += valLen
+		entries = append(entries, NewLogEntry(key, val))
+	}
+
+	// CRC covers numEntries(2) + all entry bytes, matching flushBlock's writer.
+	if it.cursor+4 > len(it.data) {
+		return fmt.Errorf("missing block checksum at offset %d", it.cursor)
+	}
+	stored := binary.LittleEndian.Uint32(it.data[it.cursor : it.cursor+4])
+	if crc32.ChecksumIEEE(it.data[blockStart:it.cursor]) != stored {
+		return fmt.Errorf("corrupted data block at offset %d: checksum mismatch", blockStart)
+	}
+	it.cursor += 4
+
+	it.block = entries
+	it.blockPos = 0
+	return nil
+}
+
 // lookup finds targetKey within this SST using the sparse block index.
 //
 // The index stores the FIRST key of each ~4KB data block, so we binser

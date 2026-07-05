@@ -305,4 +305,107 @@ func TestSSTable_FlushEmptySkiplist(t *testing.T) {
 	}
 }
 
+func TestSSTIter_RoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "iter.sst")
+
+	sl := NewSkiplist()
+	sl.Set("alpha", "1")
+	sl.Set("beta", "2")
+	sl.Set("gamma", "3")
+
+	sst, err := NewSST(path)
+	if err != nil {
+		t.Fatalf("NewSST: %v", err)
+	}
+	if err := sst.Flush(sl); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	sst.Close()
+
+	it, err := newSSTIter(path)
+	if err != nil {
+		t.Fatalf("newSSTIter: %v", err)
+	}
+
+	want := []struct{ k, v string }{{"alpha", "1"}, {"beta", "2"}, {"gamma", "3"}}
+	for i, w := range want {
+		k, v, ok, err := it.Next()
+		if err != nil {
+			t.Fatalf("Next[%d]: %v", i, err)
+		}
+		if !ok {
+			t.Fatalf("Next[%d]: got ok=false, want true", i)
+		}
+		if k != w.k || v != w.v {
+			t.Errorf("Next[%d]: expected {%s: %s}, got {%s: %s}", i, w.k, w.v, k, v)
+		}
+	}
+
+	_, _, ok, err := it.Next()
+	if err != nil {
+		t.Fatalf("Next after exhaustion errored: %v", err)
+	}
+	if ok {
+		t.Errorf("expected ok=false after exhaustion")
+	}
+}
+
+func TestSSTIter_EmptySST(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "empty.sst")
+
+	sst, err := NewSST(path)
+	if err != nil {
+		t.Fatalf("NewSST: %v", err)
+	}
+	sst.Flush(NewSkiplist())
+	sst.Close()
+
+	it, err := newSSTIter(path)
+	if err != nil {
+		t.Fatalf("newSSTIter on empty SST: %v", err)
+	}
+
+	_, _, ok, err := it.Next()
+	if err != nil {
+		t.Fatalf("Next on empty SST errored: %v", err)
+	}
+	if ok {
+		t.Errorf("expected ok=false for empty SST")
+	}
+}
+
+func TestSSTIter_CorruptedBlock(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "corrupt.sst")
+
+	sl := NewSkiplist()
+	sl.Set("k", "v")
+	sst, err := NewSST(path)
+	if err != nil {
+		t.Fatalf("NewSST: %v", err)
+	}
+	sst.Flush(sl)
+	sst.Close()
+
+	// Flip a byte inside the data region (before the index/footer).
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	raw[2] ^= 0xFF // offset 2 is inside the first block's entry payload
+	os.WriteFile(path, raw, 0644)
+
+	it, err := newSSTIter(path)
+	if err != nil {
+		t.Fatalf("newSSTIter should accept the file (footer is intact): %v", err)
+	}
+
+	_, _, _, err = it.Next()
+	if err == nil {
+		t.Errorf("expected Next to error on corrupted block, got nil")
+	}
+}
+
 // END AI SECTION
