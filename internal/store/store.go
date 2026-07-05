@@ -521,9 +521,11 @@ func (s *Store) ExecuteCompaction(level int) {
 		}
 	}
 
-	// 1. Snapshot the inputs. We copy the slice so the merge runs without
-	//    holding the lock; concurrent flushes may append new SSTs to L0 in the
-	//    meantime, which we deliberately exclude from this compaction.
+	// 1. Snapshot the inputs and decide whether targetLevel is the bottom level
+	//    (no SSTs exist at any deeper level). Both facts are read under the same
+	//    RLock so they are consistent. isBottom is stable: only this worker
+	//    goroutine ever compacts (serial-invocation invariant), so no concurrent
+	//    compaction can add a deeper level between here and the merge.
 	s.mu.RLock()
 	if level >= len(s.SSTLevels) || s.SSTLevels[level] == nil || len(s.SSTLevels[level].Tables) == 0 {
 		s.mu.RUnlock()
@@ -531,56 +533,72 @@ func (s *Store) ExecuteCompaction(level int) {
 	}
 	inputs := make([]*SST, len(s.SSTLevels[level].Tables))
 	copy(inputs, s.SSTLevels[level].Tables)
+	targetLevel := level + 1
+	isBottom := true
+	for lvl := targetLevel + 1; lvl < len(s.SSTLevels); lvl++ {
+		if s.SSTLevels[lvl] != nil && len(s.SSTLevels[lvl].Tables) > 0 {
+			isBottom = false
+			break
+		}
+	}
 	s.mu.RUnlock()
 
-	// 2. Merge with newest-wins semantics.
-	merged, err := mergeSSTs(inputs)
+	// 2. Merge with newest-wins semantics. At the bottom level tombstones are
+	//    dropped; at intermediate levels they are propagated so they keep
+	//    shadowing older copies of the key in deeper levels.
+	merged, err := mergeSSTs(inputs, isBottom)
 	if err != nil {
 		handleErr(fmt.Errorf("compaction merge (L%d): %w", level, err))
 		return
 	}
 
-	// 3. Write the result to a temp file, then atomically rename it in.
-	targetLevel := level + 1
-	finalName := fmt.Sprintf("vault_%s_L%d_%d.sst", s.nodeId, targetLevel, time.Now().UnixNano())
-	finalPath := filepath.Join(s.dir, finalName)
-	tmpPath := finalPath + ".tmp"
+	// 3+4. Write the merged SST to a temp file, rename it in, then open the
+	//      live handle. Skipped entirely when the merge produced no entries
+	//      (all entries were tombstones dropped at the bottom level) — there is
+	//      nothing to write and nothing to add to targetLevel.
+	var newSst *SST
+	if len(merged.LogEntries) > 0 {
+		finalName := fmt.Sprintf("vault_%s_L%d_%d.sst", s.nodeId, targetLevel, time.Now().UnixNano())
+		finalPath := filepath.Join(s.dir, finalName)
+		tmpPath := finalPath + ".tmp"
 
-	if err := writeSSTFile(tmpPath, merged); err != nil {
-		_ = os.Remove(tmpPath)
-		handleErr(fmt.Errorf("compaction write (L%d): %w", level, err))
-		return
-	}
-	if err := os.Rename(tmpPath, finalPath); err != nil {
-		_ = os.Remove(tmpPath)
-		handleErr(fmt.Errorf("compaction rename (L%d): %w", level, err))
-		return
+		if err := writeSSTFile(tmpPath, merged); err != nil {
+			_ = os.Remove(tmpPath)
+			handleErr(fmt.Errorf("compaction write (L%d): %w", level, err))
+			return
+		}
+		if err := os.Rename(tmpPath, finalPath); err != nil {
+			_ = os.Remove(tmpPath)
+			handleErr(fmt.Errorf("compaction rename (L%d): %w", level, err))
+			return
+		}
+
+		newSst, err = NewSST(finalPath)
+		if err != nil {
+			handleErr(fmt.Errorf("compaction open new SST (L%d): %w", level, err))
+			return
+		}
+		if err := newSst.LoadIndexBlock(); err != nil {
+			newSst.Close()
+			_ = os.Remove(finalPath)
+			handleErr(fmt.Errorf("compaction index new SST (L%d): %w", level, err))
+			return
+		}
 	}
 
-	// 4. Open the live handle for the merged SST and load its index.
-	newSst, err := NewSST(finalPath)
-	if err != nil {
-		handleErr(fmt.Errorf("compaction open new SST (L%d): %w", level, err))
-		return
-	}
-	if err := newSst.LoadIndexBlock(); err != nil {
-		newSst.Close()
-		_ = os.Remove(finalPath)
-		handleErr(fmt.Errorf("compaction index new SST (L%d): %w", level, err))
-		return
-	}
-
-	// 5. Atomically swap: drop exactly the compacted inputs from `level` and
-	//    append the merged SST to level+1. We filter by pointer identity so any
-	//    SST a concurrent flush appended since the snapshot is preserved.
+	// 5. Atomically swap: drop exactly the compacted inputs from `level` and,
+	//    if there is a merged SST, append it to targetLevel. Filtering by
+	//    pointer identity preserves any SST a concurrent flush added to L0
+	//    since the snapshot was taken.
 	s.mu.Lock()
-	for len(s.SSTLevels) <= targetLevel {
-		s.SSTLevels = append(s.SSTLevels, &SSTLevel{
-			LevelNum: len(s.SSTLevels),
-			Tables:   make([]*SST, 0),
-		})
+	if newSst != nil {
+		for len(s.SSTLevels) <= targetLevel {
+			s.SSTLevels = append(s.SSTLevels, &SSTLevel{
+				LevelNum: len(s.SSTLevels),
+				Tables:   make([]*SST, 0),
+			})
+		}
 	}
-
 	inputSet := make(map[*SST]struct{}, len(inputs))
 	for _, in := range inputs {
 		inputSet[in] = struct{}{}
@@ -592,7 +610,9 @@ func (s *Store) ExecuteCompaction(level int) {
 		}
 	}
 	s.SSTLevels[level].Tables = remaining
-	s.SSTLevels[targetLevel].Tables = append(s.SSTLevels[targetLevel].Tables, newSst)
+	if newSst != nil {
+		s.SSTLevels[targetLevel].Tables = append(s.SSTLevels[targetLevel].Tables, newSst)
+	}
 	s.mu.Unlock()
 
 	// 6. Delete the old files. Safe after the unlock: the inputs are no longer
@@ -646,12 +666,13 @@ func (h *mergeHeap) Pop() any {
 // Tables by filename, which embeds the creation timestamp.
 //
 // On a duplicate key the newest value wins (O(N log K) merge, no re-sort).
-// Tombstones are carried through verbatim — never dropped. That is always
-// correct (a tombstone keeps shadowing older data in deeper levels) but not
-// space-optimal.
-// FUTURE IMPROVEMENT: when compacting into the bottom-most level, tombstones
-// (and the keys they shadow) can be discarded entirely to reclaim space.
-func mergeSSTs(inputs []*SST) (*SSTEntry, error) {
+//
+// When dropTombstones is true (caller is compacting into the bottom-most level)
+// tombstone entries are omitted from the output: no deeper level exists that
+// could resurrect the key, so the tombstone has done its job and can be freed.
+// At any intermediate level dropTombstones must be false so that the tombstone
+// keeps shadowing older copies of the key that still live in deeper levels.
+func mergeSSTs(inputs []*SST, dropTombstones bool) (*SSTEntry, error) {
 	if len(inputs) == 0 {
 		return NewSSTableEntry(), nil
 	}
@@ -687,9 +708,15 @@ func mergeSSTs(inputs []*SST) (*SSTEntry, error) {
 		// the newest SST's copy is popped first. Subsequent pops of the same key
 		// come from older SSTs and must be discarded.
 		if !hasEmitted || item.key != lastEmitted {
-			merged.LogEntries = append(merged.LogEntries, NewLogEntry(item.key, item.val))
+			// Always advance lastEmitted even when we skip the entry — this
+			// ensures the older-SST copies of the same key (popped next due to
+			// the tie-break order) are still correctly discarded.
 			lastEmitted = item.key
 			hasEmitted = true
+
+			if !(dropTombstones && item.val == tombstone) {
+				merged.LogEntries = append(merged.LogEntries, NewLogEntry(item.key, item.val))
+			}
 		}
 
 		// Advance this SST's iterator and re-insert its next entry.

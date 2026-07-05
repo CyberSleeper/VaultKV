@@ -426,7 +426,7 @@ func TestMergeSSTs_NewestWins(t *testing.T) {
 	})
 	defer newer.Close()
 
-	merged, err := mergeSSTs([]*SST{older, newer})
+	merged, err := mergeSSTs([]*SST{older, newer}, false)
 	if err != nil {
 		t.Fatalf("mergeSSTs failed: %v", err)
 	}
@@ -456,7 +456,7 @@ func TestMergeSSTs_TombstonePassthrough(t *testing.T) {
 	newer := makeSSTFile(t, dir, "newer.sst", map[string]string{"key": tombstone})
 	defer newer.Close()
 
-	merged, err := mergeSSTs([]*SST{older, newer})
+	merged, err := mergeSSTs([]*SST{older, newer}, false)
 	if err != nil {
 		t.Fatalf("mergeSSTs failed: %v", err)
 	}
@@ -464,7 +464,7 @@ func TestMergeSSTs_TombstonePassthrough(t *testing.T) {
 		t.Fatalf("expected 1 merged entry, got %d", len(merged.LogEntries))
 	}
 	if merged.LogEntries[0].Value != tombstone {
-		t.Errorf("tombstone must survive merge; got %q", merged.LogEntries[0].Value)
+		t.Errorf("tombstone must survive merge at intermediate level; got %q", merged.LogEntries[0].Value)
 	}
 }
 
@@ -476,7 +476,7 @@ func TestMergeSSTs_SortedOutput(t *testing.T) {
 	sst2 := makeSSTFile(t, dir, "b.sst", map[string]string{"banana": "2", "date": "4"})
 	defer sst2.Close()
 
-	merged, err := mergeSSTs([]*SST{sst1, sst2})
+	merged, err := mergeSSTs([]*SST{sst1, sst2}, false)
 	if err != nil {
 		t.Fatalf("mergeSSTs failed: %v", err)
 	}
@@ -496,12 +496,53 @@ func TestMergeSSTs_SortedOutput(t *testing.T) {
 }
 
 func TestMergeSSTs_EmptyInput(t *testing.T) {
-	merged, err := mergeSSTs(nil)
+	merged, err := mergeSSTs(nil, false)
 	if err != nil {
 		t.Fatalf("mergeSSTs(nil) failed: %v", err)
 	}
 	if len(merged.LogEntries) != 0 {
 		t.Errorf("expected 0 entries from empty input, got %d", len(merged.LogEntries))
+	}
+}
+
+func TestMergeSSTs_TombstoneDroppedAtBottom(t *testing.T) {
+	dir := t.TempDir()
+	// older SST has a live value; newer SST has a tombstone for the same key.
+	older := makeSSTFile(t, dir, "older.sst", map[string]string{"key": "live_val", "other": "kept"})
+	defer older.Close()
+	newer := makeSSTFile(t, dir, "newer.sst", map[string]string{"key": tombstone})
+	defer newer.Close()
+
+	merged, err := mergeSSTs([]*SST{older, newer}, true /* bottom level */)
+	if err != nil {
+		t.Fatalf("mergeSSTs failed: %v", err)
+	}
+
+	for _, e := range merged.LogEntries {
+		if e.Key == "key" {
+			t.Errorf("tombstone entry for 'key' must be dropped at bottom level, but got value %q", e.Value)
+		}
+	}
+	if len(merged.LogEntries) != 1 || merged.LogEntries[0].Key != "other" {
+		t.Errorf("expected only 'other' to survive; got %v", merged.LogEntries)
+	}
+}
+
+func TestMergeSSTs_AllTombstonesEmptyResult(t *testing.T) {
+	dir := t.TempDir()
+	// Every key is a tombstone — the bottom-level merge should produce nothing.
+	sst := makeSSTFile(t, dir, "all_tomb.sst", map[string]string{
+		"a": tombstone,
+		"b": tombstone,
+	})
+	defer sst.Close()
+
+	merged, err := mergeSSTs([]*SST{sst}, true /* bottom level */)
+	if err != nil {
+		t.Fatalf("mergeSSTs failed: %v", err)
+	}
+	if len(merged.LogEntries) != 0 {
+		t.Errorf("expected empty result when all entries are tombstones at bottom level, got %d entries", len(merged.LogEntries))
 	}
 }
 
